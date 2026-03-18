@@ -121,7 +121,10 @@ func NewResponse(id ID, result any, resErr error) (*Response, error) {
 
 func (msg *Response) marshal(to *wireCombined) {
 	to.ID = msg.ID
-	to.Result = msg.Result
+	if msg.Result != nil {
+		result := msg.Result
+		to.Result = &result
+	}
 	to.Error = toWireError(msg.Error)
 }
 
@@ -176,12 +179,19 @@ func DecodeMessage(data []byte) (Message, error) {
 	if !msg.ID.IsValid() {
 		return nil, ErrInvalidRequest
 	}
-	resp := &Response{
-		ID:     msg.ID,
-		Result: msg.Result,
+
+	hasResult := msg.Result != nil
+	hasError := msg.Error != nil
+	if hasResult == hasError {
+		return nil, ErrInvalidRequest
 	}
-	// set error if there is one
-	if msg.Error != nil {
+
+	resp := &Response{
+		ID: msg.ID,
+	}
+	if hasResult {
+		resp.Result = *msg.Result
+	} else {
 		resp.Error = msg.Error
 	}
 	return resp, nil
