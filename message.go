@@ -114,8 +114,8 @@ func (msg *Request) marshal(to *wireCombined) {
 	to.Params = msg.Params
 }
 
-func (msg *Response) NewResponse(id ID, result any, resErr error) (*Response, error) {
-	responseRaw, err := marshalToRaw(msg.Result)
+func NewResponse(id ID, result any, resErr error) (*Response, error) {
+	responseRaw, err := marshalToRaw(result)
 	return &Response{ID: id, Result: responseRaw, Error: resErr}, err
 }
 
