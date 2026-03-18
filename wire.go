@@ -28,7 +28,7 @@ const RPCVersion = "2.0"
 // we used a combined struct so we can decode and check which it is
 type wireCombined struct {
 	RPCVersion string          `json:"jsonrpc"`
-	ID         any             `json:"id,omitempty"` // id can be string or int so we set to any and switch type later
+	ID         ID              `json:"id,omitzero"`
 	Method     string          `json:"method,omitempty"`
 	Params     json.RawMessage `json:"params,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
