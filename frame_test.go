@@ -18,7 +18,7 @@ func (m *mockRWC) Close() error { return nil }
 
 func TestRawFramer(t *testing.T) {
 	ctx := context.Background()
-	framer := NewFramer()
+	framer := NewRawFramer()
 	buf := &bytes.Buffer{}
 	rwc := &mockRWC{Reader: buf, Writer: buf}
 	r, w := framer.Frame(rwc)
@@ -83,7 +83,7 @@ func TestHeaderFramerInvalidContentLength(t *testing.T) {
 
 func TestRawFramerMultiple(t *testing.T) {
 	ctx := context.Background()
-	framer := NewFramer()
+	framer := NewRawFramer()
 	buf := &bytes.Buffer{}
 	rwc := &mockRWC{Reader: buf, Writer: buf}
 	r, w := framer.Frame(rwc)
@@ -166,7 +166,7 @@ func TestReaderContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	framer := NewFramer()
+	framer := NewRawFramer()
 	r, _ := framer.Frame(&mockRWC{Reader: &bytes.Buffer{}, Writer: io.Discard})
 
 	_, err := r.Read(ctx)
@@ -179,7 +179,7 @@ func TestWriterContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	framer := NewFramer()
+	framer := NewRawFramer()
 	_, w := framer.Frame(&mockRWC{Reader: &bytes.Buffer{}, Writer: io.Discard})
 
 	msg, _ := NewNotification("test", nil)

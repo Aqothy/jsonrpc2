@@ -33,7 +33,7 @@ type rawWriter struct {
 	out io.Writer
 }
 
-func NewFramer() Framer {
+func NewRawFramer() Framer {
 	return rawFramer{}
 }
 
