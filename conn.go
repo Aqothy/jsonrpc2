@@ -2,6 +2,8 @@ package jsonrpc2
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -139,6 +141,60 @@ func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Bind
 type inFlightState struct {
 	closer io.Closer
 }
+
+// async request tracks the state of an outgoing request until its response is
+// received. request is from server to client
+type PendingCall struct {
+	id       ID
+	ready    chan struct{} // closed after response has been set
+	response *Response
+}
+
+func (ac *PendingCall) ID() ID {
+	return ac.id
+}
+
+// check if result is already prepared
+func (ac *PendingCall) IsReady() bool {
+	select {
+	case <-ac.ready:
+		return true
+	default:
+		return false
+	}
+}
+
+func (ac *PendingCall) retire(response *Response) {
+	select {
+	case <-ac.ready:
+		panic(fmt.Sprintf("jsonrpc2: retire called twice for ID %v", ac.id))
+	default:
+	}
+
+	ac.response = response
+	// use close instead of sending value so that all waiters are unblocked
+	// once closed, await is unblocked and response is available
+	close(ac.ready)
+}
+
+func (ac *PendingCall) Await(ctx context.Context, result any) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ac.ready:
+	}
+
+	if ac.response.Error != nil {
+		return ac.response.Error
+	}
+
+	if result == nil {
+		return nil
+	}
+
+	return json.Unmarshal(ac.response.Result, result)
+}
+
 // notDone wraps context and returns nil for Done so that the connection's read
 // loop will not exit until the connection is closed or an error occurs, even if
 // the context passed to NewConnection is canceled. This allows the caller to
