@@ -63,6 +63,7 @@ func (o ConnectionOptions) Bind(context.Context, *Connection) ConnectionOptions 
 	return o
 }
 
+// low level, provide everything yourself like reader, writer, etc, no framer provided
 func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 	ctx = notDone{ctx}
 
@@ -81,6 +82,10 @@ func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 	return c
 }
 
+// Connection manages the jsonrpc2 protocol, connecting responses back to their
+// calls.
+// Connection is bidirectional; it does not have a designated server or client
+// end.
 type Connection struct {
 	seq int64 // must only be accessed using atomic operations
 
@@ -107,6 +112,7 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 	return err
 }
 
+// high level, provides default header framer
 func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Binder, onDone func()) *Connection {
 	ctx := notDone{bindCtx}
 
@@ -139,7 +145,89 @@ func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Bind
 // inFlightState records the state of the incoming and outgoing calls on a
 // Connection.
 type inFlightState struct {
-	closer io.Closer
+	connClosing bool  // true when the Connection's Close method has been called
+	reading     bool  // true while the readIncoming goroutine is running
+	readErr     error // non-nil when the readIncoming goroutine exits (typically io.EOF)
+	writeErr    error // non-nil if a call to the Writer has failed with a non-canceled Context
+
+	// closer shuts down and cleans up the Reader and Writer state, ideally
+	// interrupting any Read or Write call that is currently blocked. It is closed
+	// when the state is idle and one of: connClosing is true, readErr is non-nil,
+	// or writeErr is non-nil.
+	//
+	// After the closer has been invoked, the closer field is set to nil
+	// and the closeErr field is simultaneously set to its result.
+	closer   io.Closer
+	closeErr error // error returned from closer.Close
+
+	outgoingCalls         map[ID]*PendingCall
+	outgoingNotifications int // # of notifications awaiting "write"
+
+	// incoming stores the total number of incoming calls and notifications
+	// that have not yet written or processed a result.
+	incoming     int
+	incomingByID map[ID]*incomingRequest
+
+	// handlerQueue stores the backlog of calls and notifications that were not
+	// already handled by a preempter.
+	// The queue does not include the request currently being handled (if any).
+	handlerQueue   []*incomingRequest
+	handlerRunning bool
+}
+
+func (s *inFlightState) idle() bool {
+	return len(s.outgoingCalls) == 0 && s.outgoingNotifications == 0 && s.incoming == 0 && !s.handlerRunning
+}
+
+func (s *inFlightState) shouldShutDown(errClosing error) error {
+	if s.connClosing {
+		return errClosing
+	}
+
+	if s.readErr != nil {
+		return fmt.Errorf("%w: %v", errClosing, s.readErr)
+	}
+	if s.writeErr != nil {
+		return fmt.Errorf("%w: %v", errClosing, s.writeErr)
+	}
+	return nil
+}
+
+func (c *Connection) updateInFlight(f func(*inFlightState)) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	s := &c.state
+	f(s)
+
+	select {
+	case <-c.done:
+		// The connection was already completely done at the start of this call to
+		// updateInFlight, so it must remain so. (The call to f should have noticed
+		// that and avoided making any updates that would cause the state to be
+		// non-idle.)
+		if !s.idle() {
+			panic("jsonrpc2_v2: updateInFlight transitioned to non-idle when already done")
+		}
+
+		return
+	default:
+	}
+
+	if s.idle() && s.shouldShutDown(ErrUnknown) != nil {
+		if s.closer != nil {
+			s.closeErr = s.closer.Close()
+			s.closer = nil
+		}
+		if s.reading {
+
+		} else {
+			if c.onDone != nil {
+				c.onDone()
+			}
+			close(c.done)
+		}
+	}
 }
 
 // async request tracks the state of an outgoing request until its response is
@@ -193,6 +281,12 @@ func (ac *PendingCall) Await(ctx context.Context, result any) error {
 	}
 
 	return json.Unmarshal(ac.response.Result, result)
+}
+
+type incomingRequest struct {
+	*Request // the request being processed
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // notDone wraps context and returns nil for Done so that the connection's read

@@ -17,6 +17,15 @@ var (
 	ErrInternal = NewError(-32603, "JSON RPC internal error")
 
 	// - 32000 to 32099 are reserved for implementation defined server errors
+	// ErrServerOverloaded is returned when a message was refused due to a
+	// server being temporarily unable to accept any new messages.
+	ErrServerOverloaded = NewError(-32000, "JSON RPC overloaded")
+	// ErrUnknown should be used for all non coded errors.
+	ErrUnknown = NewError(-32001, "JSON RPC unknown error")
+	// ErrServerClosing is returned for calls that arrive while the server is closing.
+	ErrServerClosing = NewError(-32002, "JSON RPC server is closing")
+	// ErrClientClosing is a dummy error returned for calls initiated while the client is closing.
+	ErrClientClosing = NewError(-32003, "JSON RPC client is closing")
 )
 
 // NOTE: json.RawMessage is used instead of []byte so that we can unmarshal the json later when we know the type
