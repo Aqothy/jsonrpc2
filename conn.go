@@ -3,6 +3,7 @@ package jsonrpc2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -45,17 +46,22 @@ type ConnectionOptions struct {
 	// while serving the connection, such as protocol errors or invariant
 	// violations. (If nil, internal errors result in panics.)
 	OnInternalError func(error)
+	// OnNotificationError, if non-nil, is called with errors returned while
+	// handling notifications. Notifications cannot receive wire responses, so
+	// these errors are otherwise dropped.
+	OnNotificationError func(error)
 }
 
 // connection config for bidirectional jsonrpc2 connection
 type ConnectionConfig struct {
-	Reader          Reader
-	Writer          Writer
-	Closer          io.Closer
-	Preempter       Preempter
-	Bind            func(*Connection) Handler
-	OnDone          func()
-	OnInternalError func(error)
+	Reader              Reader
+	Writer              Writer
+	Closer              io.Closer
+	Preempter           Preempter
+	Bind                func(*Connection) Handler
+	OnDone              func()
+	OnInternalError     func(error)
+	OnNotificationError func(error)
 }
 
 // Bind returns the options unmodified.
@@ -68,11 +74,12 @@ func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 	ctx = notDone{ctx}
 
 	c := &Connection{
-		state:           inFlightState{closer: cfg.Closer},
-		done:            make(chan struct{}),
-		writer:          make(chan Writer, 1),
-		onDone:          cfg.OnDone,
-		onInternalError: cfg.OnInternalError,
+		state:               inFlightState{closer: cfg.Closer},
+		done:                make(chan struct{}),
+		writer:              make(chan Writer, 1),
+		onDone:              cfg.OnDone,
+		onInternalError:     cfg.OnInternalError,
+		onNotificationError: cfg.OnNotificationError,
 	}
 
 	c.handler = cfg.Bind(c)
@@ -97,11 +104,226 @@ type Connection struct {
 
 	handler Handler
 
-	onInternalError func(error)
-	onDone          func()
+	onInternalError     func(error)
+	onNotificationError func(error)
+	onDone              func()
+}
+
+func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter Preempter) {
+	reqCtx, cancel := context.WithCancel(ctx)
+
+	req := &incomingRequest{
+		Request: msg,
+		ctx:     reqCtx,
+		cancel:  cancel,
+	}
+
+	var err error
+	c.updateInFlight(func(s *inFlightState) {
+		s.incoming++
+
+		if req.IsCall() {
+			if s.incomingByID[req.ID] != nil {
+				err = fmt.Errorf("%w: request ID %v already in use", ErrInvalidRequest, req.ID)
+				req.ID = ID{}
+				return
+			}
+
+			if s.incomingByID == nil {
+				s.incomingByID = make(map[ID]*incomingRequest)
+			}
+			s.incomingByID[req.ID] = req
+		}
+
+		err = s.shouldShutDown(ErrServerClosing)
+	})
+
+	if err != nil {
+		c.processResult("acceptRequest", req, nil, err)
+		return
+	}
+
+	if preempter != nil {
+		result, err := preempter.Preempt(req.ctx, req.Request)
+		if req.IsCall() && errors.Is(err, ErrAsyncResponse) {
+			return
+		}
+
+		if !errors.Is(err, ErrNotHandled) {
+			c.processResult("Preempt", req, result, err)
+			return
+		}
+	}
+
+	c.updateInFlight(func(s *inFlightState) {
+		err = s.shouldShutDown(ErrServerClosing)
+		if err != nil {
+			return
+		}
+		s.handlerQueue = append(s.handlerQueue, req)
+		if !s.handlerRunning {
+			s.handlerRunning = true
+			go c.handleAsync()
+		}
+	})
+
+	if err != nil {
+		c.processResult("acceptRequest", req, nil, err)
+	}
+}
+
+func (c *Connection) processResult(from any, req *incomingRequest, result any, err error) error {
+	switch err {
+	case ErrAsyncResponse:
+		if !req.IsCall() {
+			return c.internalErrorf("%#v returned ErrAsyncResponse for a %q Request without an ID", from, req.Method)
+		}
+		return nil
+	case ErrNotHandled, ErrMethodNotFound:
+		err = fmt.Errorf("%w: %q", ErrMethodNotFound, req.Method)
+	}
+
+	if result != nil && err != nil {
+		c.internalErrorf("%#v returned a non-nil result with a non-nil error for %s:\n%v\n%#v", from, req.Method, err, result)
+		result = nil // Discard the spurious result and respond with err.
+	}
+
+	if req.IsCall() {
+		if result == nil && err == nil {
+			err = c.internalErrorf("%#v returned a nil result and nil error for a %q Request that requires a Response", from, req.Method)
+		}
+
+		res, respErr := NewResponse(req.ID, result, err)
+
+		c.updateInFlight(func(s *inFlightState) {
+			delete(s.incomingByID, req.ID)
+		})
+
+		if respErr == nil {
+			writerErr := c.write(notDone{req.ctx}, res)
+			if err == nil {
+				err = writerErr
+			}
+		} else {
+			err = c.internalErrorf("%#v returned a malformed result for %q: %w", from, req.Method, respErr)
+		}
+	} else { // req is a notification
+		if result != nil {
+			err = c.internalErrorf("%#v returned a non-nil result for a %q Request without an ID", from, req.Method)
+		} else if err != nil {
+			err = fmt.Errorf("%w: %q notification failed: %v", ErrInternal, req.Method, err)
+		}
+		if err != nil {
+			c.reportNotificationError(err)
+		}
+	}
+
+	req.cancel()
+	c.updateInFlight(func(s *inFlightState) {
+		if s.incoming == 0 {
+
+			panic("jsonrpc2_v2: processResult called when incoming count is already zero")
+		}
+		s.incoming--
+	})
+
+	return nil
+}
+
+func (c *Connection) handleAsync() {
+	for {
+		var req *incomingRequest
+		c.updateInFlight(func(s *inFlightState) {
+			if len(s.handlerQueue) > 0 {
+				req, s.handlerQueue = s.handlerQueue[0], s.handlerQueue[1:]
+			} else {
+				s.handlerRunning = false
+			}
+		})
+		if req == nil {
+			return
+		}
+
+		// Only deliver to the Handler if not already canceled.
+		if err := req.ctx.Err(); err != nil {
+			c.updateInFlight(func(s *inFlightState) {
+				if s.writeErr != nil {
+					// TODO use WithCancelCause
+					err = fmt.Errorf("%w: %v", ErrServerClosing, s.writeErr)
+				}
+			})
+			c.processResult("handleAsync", req, nil, err)
+			continue
+		}
+
+		result, err := c.handler.Handle(req.ctx, req.Request)
+		c.processResult(c.handler, req, result, err)
+	}
+
+}
+
+func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter Preempter) {
+	var err error
+
+	for {
+		var msg Message
+		msg, err = reader.Read(ctx)
+		if err != nil {
+			break
+		}
+
+		switch msg := msg.(type) {
+		case *Request:
+			c.acceptRequest(ctx, msg, preempter)
+		case *Response:
+			var unexpected bool
+			c.updateInFlight(func(s *inFlightState) {
+				if ac, ok := s.outgoingCalls[msg.ID]; ok {
+					delete(s.outgoingCalls, msg.ID)
+					ac.retire(msg)
+				} else {
+					// dont call user internalErrorf here since user code could
+					// call back into inFlightState which causes deadlock
+					unexpected = true
+				}
+			})
+			if unexpected {
+				c.internalErrorf("received response for unknown request ID %v", msg.ID)
+			}
+
+		default:
+			c.internalErrorf("Read returned an unexpected message type: %T", msg)
+		}
+
+		c.updateInFlight(func(s *inFlightState) {
+			s.reading = false
+			s.readErr = err
+
+			for id, ac := range s.outgoingCalls {
+				ac.retire(&Response{ID: id, Error: err})
+			}
+			s.outgoingCalls = nil
+		})
+
+	}
 }
 
 func (c *Connection) start(ctx context.Context, reader Reader, preempter Preempter) {
+	c.updateInFlight(func(s *inFlightState) {
+		select {
+		case <-c.done:
+			// Bind already closed the connection; don't start a goroutine to read it
+			return
+		default:
+		}
+
+		// The goroutine started here will continue until the underlying stream is closed.
+		//
+		// (If the Binder closed the Connection already, this should error out and
+		// return almost immediately.)
+		s.reading = true
+		go c.readIncoming(ctx, reader, preempter)
+	})
 }
 
 func (c *Connection) write(ctx context.Context, msg Message) error {
@@ -109,7 +331,71 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 	defer func() { c.writer <- writer }()
 	err := writer.Write(ctx, msg)
 
+	// if ctx.Err() is non-nil, the error is likely due to the context being
+	// canceled, so we shouldn't treat it as a connection error, but if err !=
+	// and ctx.Err() == nil, then call to write failed
+	// and we should cancel incoming calls
+	if err != nil && ctx.Err() == nil {
+		c.updateInFlight(func(s *inFlightState) {
+			if s.writeErr == nil {
+				s.writeErr = err
+				for _, r := range s.incomingByID {
+					r.cancel()
+				}
+			}
+		})
+	}
+
 	return err
+}
+
+func (c *Connection) Notify(ctx context.Context, method string, params any) (err error) {
+	attempted := false
+
+	defer func() {
+		if attempted {
+			c.updateInFlight(func(s *inFlightState) {
+				s.outgoingNotifications--
+			})
+		}
+	}()
+
+	c.updateInFlight(func(s *inFlightState) {
+		// If the connection is shutting down, allow outgoing notifications only if
+		// there is at least one call still in flight. The number of calls in flight
+		// cannot increase once shutdown begins, and allowing outgoing notifications
+		// may permit notifications that will cancel in-flight calls.
+		if len(s.outgoingCalls) == 0 && s.incoming == 0 {
+			err = s.shouldShutDown(ErrClientClosing)
+			if err != nil {
+				return
+			}
+		}
+		s.outgoingNotifications++
+		attempted = true
+	})
+
+	if err != nil {
+		return err
+	}
+
+	notify, err := NewNotification(method, params)
+
+	if err != nil {
+		return fmt.Errorf("marshaling notify parameters: %v", err)
+	}
+
+	return c.write(ctx, notify)
+}
+
+func (c *Connection) internalErrorf(format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	if c.onInternalError == nil {
+		panic("jsonrpc2: internal error: " + err.Error())
+	}
+	c.onInternalError(err)
+
+	return fmt.Errorf("%w: %v", ErrInternal, err)
 }
 
 // high level, provides default header framer
@@ -135,6 +421,7 @@ func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Bind
 	}
 
 	c.onInternalError = options.OnInternalError
+	c.onNotificationError = options.OnNotificationError
 
 	reader, writer := framer.Frame(rwc)
 	c.writer <- writer
@@ -312,4 +599,10 @@ func (ic notDone) Err() error {
 }
 func (ic notDone) Deadline() (deadline time.Time, ok bool) {
 	return time.Time{}, false
+}
+
+func (c *Connection) reportNotificationError(err error) {
+	if c.onNotificationError != nil {
+		c.onNotificationError(err)
+	}
 }
