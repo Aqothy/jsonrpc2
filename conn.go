@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
+	"sync/atomic"
 )
 
 // Binder builds a connection configuration.
@@ -71,7 +71,7 @@ func (o ConnectionOptions) Bind(context.Context, *Connection) ConnectionOptions 
 
 // low level, provide everything yourself like reader, writer, etc, no framer provided
 func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
-	ctx = notDone{ctx}
+	ctx = context.WithoutCancel(ctx)
 
 	c := &Connection{
 		state:               inFlightState{closer: cfg.Closer},
@@ -109,8 +109,99 @@ type Connection struct {
 	onDone              func()
 }
 
+// Invokes target method and returns PendingCall which can be used to await the
+// response
+// You dont have to wait for resopnse, can be ignored if not needed
+// If sending call failed then resopnse will be ready and have the error in it
+func (c *Connection) Call(ctx context.Context, method string, params any) *PendingCall {
+	id := Int64ID((atomic.AddInt64(&c.seq, 1)))
+
+	ac := &PendingCall{
+		id:    id,
+		ready: make(chan struct{}),
+	}
+
+	// When this method returns, either ac is retired, or the request has been
+	// written successfully and the call is awaiting a response (to be provided by
+	// the readIncoming goroutine).
+
+	call, err := NewCall(ac.id, method, params)
+	if err != nil {
+		ac.retire(&Response{ID: id, Error: fmt.Errorf("marshalling call parameters: %w", err)})
+		return ac
+	}
+
+	c.updateInFlight(func(s *inFlightState) {
+		err = s.shouldShutDown(ErrClientClosing)
+		if err != nil {
+			return
+		}
+
+		if s.outgoingCalls == nil {
+			s.outgoingCalls = make(map[ID]*PendingCall)
+		}
+
+		s.outgoingCalls[ac.id] = ac
+	})
+
+	if err != nil {
+		ac.retire(&Response{ID: id, Error: err})
+		return ac
+	}
+
+	if err := c.write(ctx, call); err != nil {
+		c.updateInFlight(func(s *inFlightState) {
+			if s.outgoingCalls[ac.id] == ac {
+				delete(s.outgoingCalls, ac.id)
+				ac.retire(&Response{ID: id, Error: err})
+			} else {
+				// ac was already retired by the readIncoming goroutine:
+				// perhaps our write raced with the Read side of the connection breaking.
+			}
+		})
+	}
+
+	return ac
+}
+
+// Notify invokes the target method, has no id and doesn't expact response.
+func (c *Connection) Notify(ctx context.Context, method string, params any) (err error) {
+	attempted := false
+
+	defer func() {
+		if attempted {
+			c.updateInFlight(func(s *inFlightState) {
+				s.outgoingNotifications--
+			})
+		}
+	}()
+
+	c.updateInFlight(func(s *inFlightState) {
+		// if there are still calls active a notification may be needed cancel
+		// or manage them, so only shut down if no outgoing or incoming
+		if len(s.outgoingCalls) == 0 && len(s.incomingByID) == 0 {
+			err = s.shouldShutDown(ErrClientClosing)
+			if err != nil {
+				return
+			}
+		}
+		s.outgoingNotifications++
+		attempted = true
+	})
+	if err != nil {
+		return err
+	}
+
+	notify, err := NewNotification(method, params)
+	if err != nil {
+		return fmt.Errorf("marshaling notify parameters: %v", err)
+	}
+
+	return c.write(ctx, notify)
+}
+
 func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter Preempter) {
-	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx, cancel := context.WithCancelCause(ctx)
 
 	req := &incomingRequest{
 		Request: msg,
@@ -125,7 +216,7 @@ func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter 
 		if req.IsCall() {
 			if s.incomingByID[req.ID] != nil {
 				err = fmt.Errorf("%w: request ID %v already in use", ErrInvalidRequest, req.ID)
-				req.ID = ID{}
+				req.ID = ID{} // Don't misattribute this error to the existing request.
 				return
 			}
 
@@ -200,7 +291,7 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 		})
 
 		if respErr == nil {
-			writerErr := c.write(notDone{req.ctx}, res)
+			writerErr := c.write(context.WithoutCancel(req.ctx), res)
 			if err == nil {
 				err = writerErr
 			}
@@ -218,7 +309,7 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 		}
 	}
 
-	req.cancel()
+	req.cancel(context.Canceled)
 	c.updateInFlight(func(s *inFlightState) {
 		if s.incoming == 0 {
 
@@ -246,12 +337,9 @@ func (c *Connection) handleAsync() {
 
 		// Only deliver to the Handler if not already canceled.
 		if err := req.ctx.Err(); err != nil {
-			c.updateInFlight(func(s *inFlightState) {
-				if s.writeErr != nil {
-					// TODO use WithCancelCause
-					err = fmt.Errorf("%w: %v", ErrServerClosing, s.writeErr)
-				}
-			})
+			if cause := context.Cause(req.ctx); cause != nil {
+				err = cause
+			}
 			c.processResult("handleAsync", req, nil, err)
 			continue
 		}
@@ -339,8 +427,9 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 		c.updateInFlight(func(s *inFlightState) {
 			if s.writeErr == nil {
 				s.writeErr = err
+				cause := fmt.Errorf("%w: %v", ErrServerClosing, err)
 				for _, r := range s.incomingByID {
-					r.cancel()
+					r.cancel(cause)
 				}
 			}
 		})
@@ -398,9 +487,42 @@ func (c *Connection) internalErrorf(format string, args ...any) error {
 	return fmt.Errorf("%w: %v", ErrInternal, err)
 }
 
+// Cancel cancels the Context passed to the Handle call for the inbound message
+// with the given ID.
+//
+// Cancel will not complain if the ID is not a currently active message, and it
+// will not cause any messages that have not arrived yet with that ID to be
+// cancelled.
+func (c *Connection) Cancel(id ID) {
+	var req *incomingRequest
+	c.updateInFlight(func(s *inFlightState) {
+		req = s.incomingByID[id]
+	})
+	if req != nil {
+		req.cancel(context.Canceled)
+	}
+}
+
+// Wait blocks until the connection is fully closed, but does not close it.
+func (c *Connection) Wait() error {
+	var err error
+	<-c.done
+	c.updateInFlight(func(s *inFlightState) {
+		err = s.closeErr
+	})
+	return err
+}
+
+func (c *Connection) Close() error {
+	// Stop handling new requests, and interrupt the reader (by closing the
+	// connection) as soon as the active requests finish.
+	c.updateInFlight(func(s *inFlightState) { s.connClosing = true })
+	return c.Wait()
+}
+
 // high level, provides default header framer
 func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Binder, onDone func()) *Connection {
-	ctx := notDone{bindCtx}
+	ctx := context.WithoutCancel(bindCtx)
 
 	c := &Connection{
 		state:  inFlightState{closer: rwc},
@@ -573,32 +695,7 @@ func (ac *PendingCall) Await(ctx context.Context, result any) error {
 type incomingRequest struct {
 	*Request // the request being processed
 	ctx      context.Context
-	cancel   context.CancelFunc
-}
-
-// notDone wraps context and returns nil for Done so that the connection's read
-// loop will not exit until the connection is closed or an error occurs, even if
-// the context passed to NewConnection is canceled. This allows the caller to
-// use a context with a timeout or deadline without worrying about it causing
-// the connection to close prematurely and losing messages that are in flight.
-// The connection will still respect the context's values, so it can be used to
-// pass request-scoped values to handlers.
-type notDone struct {
-	ctx context.Context
-}
-
-func (ic notDone) Value(key any) any {
-	return ic.ctx.Value(key)
-}
-
-func (ic notDone) Done() <-chan struct{} {
-	return nil
-}
-func (ic notDone) Err() error {
-	return nil
-}
-func (ic notDone) Deadline() (deadline time.Time, ok bool) {
-	return time.Time{}, false
+	cancel   context.CancelCauseFunc
 }
 
 func (c *Connection) reportNotificationError(err error) {
