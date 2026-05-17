@@ -164,40 +164,21 @@ func (c *Connection) Call(ctx context.Context, method string, params any) *Pendi
 	return ac
 }
 
-// Notify invokes the target method, has no id and doesn't expact response.
-func (c *Connection) Notify(ctx context.Context, method string, params any) (err error) {
-	attempted := false
-
-	defer func() {
-		if attempted {
-			c.updateInFlight(func(s *inFlightState) {
-				s.outgoingNotifications--
-			})
-		}
-	}()
-
+// Reponds to incoming call.
+func (c *Connection) Respond(id ID, result any, err error) error {
+	var req *incomingRequest
 	c.updateInFlight(func(s *inFlightState) {
-		// if there are still calls active a notification may be needed cancel
-		// or manage them, so only shut down if no outgoing or incoming
-		if len(s.outgoingCalls) == 0 && len(s.incomingByID) == 0 {
-			err = s.shouldShutDown(ErrClientClosing)
-			if err != nil {
-				return
-			}
-		}
-		s.outgoingNotifications++
-		attempted = true
+		req = s.incomingByID[id]
 	})
-	if err != nil {
-		return err
+	if req == nil {
+		return c.internalErrorf("Request not found for ID %v", id)
 	}
 
-	notify, err := NewNotification(method, params)
-	if err != nil {
-		return fmt.Errorf("marshaling notify parameters: %v", err)
+	if err == ErrAsyncResponse {
+		err = c.internalErrorf("Respond called with ErrAsyncReponse for %q", req.Method)
 	}
 
-	return c.write(ctx, notify)
+	return c.processResult("Respond", req, result, err)
 }
 
 func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter Preempter) {
@@ -438,6 +419,7 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 	return err
 }
 
+// Notify invokes the target method, has no id and doesn't expact response.
 func (c *Connection) Notify(ctx context.Context, method string, params any) (err error) {
 	attempted := false
 
@@ -450,11 +432,9 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) (err
 	}()
 
 	c.updateInFlight(func(s *inFlightState) {
-		// If the connection is shutting down, allow outgoing notifications only if
-		// there is at least one call still in flight. The number of calls in flight
-		// cannot increase once shutdown begins, and allowing outgoing notifications
-		// may permit notifications that will cancel in-flight calls.
-		if len(s.outgoingCalls) == 0 && s.incoming == 0 {
+		// if there are still calls active a notification may be needed cancel
+		// or manage them, so only shut down if no outgoing or incoming
+		if len(s.outgoingCalls) == 0 && len(s.incomingByID) == 0 {
 			err = s.shouldShutDown(ErrClientClosing)
 			if err != nil {
 				return
@@ -463,13 +443,11 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) (err
 		s.outgoingNotifications++
 		attempted = true
 	})
-
 	if err != nil {
 		return err
 	}
 
 	notify, err := NewNotification(method, params)
-
 	if err != nil {
 		return fmt.Errorf("marshaling notify parameters: %v", err)
 	}
