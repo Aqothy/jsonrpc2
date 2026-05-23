@@ -2,6 +2,7 @@ package jsonrpc2
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,42 +23,46 @@ type Framer interface {
 	Frame(io.ReadWriteCloser) (Reader, Writer)
 }
 
-// reads raw json messages without framing (Content-Length header)
-type rawFramer struct{}
+// new line framer for MCP, allows for multiline/pretty-printed json
+type lineFramer struct{}
 
-type rawReader struct {
+type lineReader struct {
 	in *json.Decoder
 }
 
-type rawWriter struct {
+type lineWriter struct {
 	out io.Writer
 }
 
-func NewRawFramer() Framer {
-	return rawFramer{}
+func NewLineFramer() Framer { return lineFramer{} }
+
+func (f lineFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
+	return &lineReader{json.NewDecoder(rwc)}, &lineWriter{out: rwc}
 }
 
-func (f rawFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
-	return &rawReader{json.NewDecoder(rwc)}, &rawWriter{rwc}
-}
-
-func (r *rawReader) Read(ctx context.Context) (Message, error) {
-	// if context is done, return error immediately, else just move on
+func (r *lineReader) Read(ctx context.Context) (Message, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
+
 	var raw json.RawMessage
-	// continues reading till it gets a full json message, then decode it
 	if err := r.in.Decode(&raw); err != nil {
 		return nil, err
 	}
-	msg, err := DecodeMessage(raw)
-	return msg, err
+	var tr [1]byte
+	if n, err := r.in.Buffered().Read(tr[:]); n > 0 {
+		if tr[0] != '\n' && tr[0] != '\r' {
+			return nil, fmt.Errorf("invalid trailing data after JSON-RPC message")
+		}
+	} else if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return DecodeMessage(raw)
 }
 
-func (w *rawWriter) Write(ctx context.Context, msg Message) error {
+func (w *lineWriter) Write(ctx context.Context, msg Message) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -67,12 +72,69 @@ func (w *rawWriter) Write(ctx context.Context, msg Message) error {
 	if err != nil {
 		return fmt.Errorf("marshaling message: %v", err)
 	}
+	data = append(data, '\n')
+
+	_, err = w.out.Write(data)
+	return err
+}
+
+// new line delimited framer for ACP
+type ndFramer struct{}
+
+type ndReader struct {
+	in *bufio.Reader
+}
+
+type ndWriter struct {
+	out io.Writer
+}
+
+func NewNdFramer() Framer { return ndFramer{} }
+
+func (f ndFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
+	return &ndReader{bufio.NewReader(rwc)}, &ndWriter{out: rwc}
+}
+
+func (r *ndReader) Read(ctx context.Context) (Message, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	line, err := r.in.ReadBytes('\n')
+	if err != nil {
+		if err == io.EOF && len(line) > 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+
+	line = bytes.TrimRight(line, "\r\n")
+	if len(bytes.TrimSpace(line)) == 0 {
+		return nil, fmt.Errorf("empty newline-delimited JSON-RPC message")
+	}
+	return DecodeMessage(line)
+}
+
+func (w *ndWriter) Write(ctx context.Context, msg Message) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	data, err := EncodeMessage(msg)
+	if err != nil {
+		return fmt.Errorf("marshaling message: %v", err)
+	}
+	data = append(data, '\n')
+
 	_, err = w.out.Write(data)
 	return err
 }
 
 // messages with framed headers, where each message is preceded by a Content-Length header specifying the length of the message in bytes
-// used by lsp and acp
+// used by LSP
 type headerFramer struct{}
 
 type headerReader struct {

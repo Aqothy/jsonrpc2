@@ -7,8 +7,6 @@ import (
 
 // these are sentinel errors
 var (
-	ErrIdleTimeout = errors.New("Timed out waiting for new connections")
-
 	// when preempter or handler indicates that it didn't handle the request
 	ErrNotHandled = errors.New("JSON RPC request not handled")
 

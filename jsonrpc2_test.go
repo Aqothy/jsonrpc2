@@ -46,12 +46,6 @@ type call struct {
 	expect any
 }
 
-type async struct {
-	name   string
-	method string
-	params any
-}
-
 type collect struct {
 	name   string
 	expect any
@@ -93,11 +87,6 @@ func (test echo) Invoke(t *testing.T, ctx context.Context, h *handler) {
 		t.Fatalf("%v:Echo failed: %v", test.method, err)
 	}
 	verifyResults(t, test.method, results, test.expect)
-}
-
-func (test async) Name() string { return test.name }
-func (test async) Invoke(t *testing.T, ctx context.Context, h *handler) {
-	h.calls[test.name] = h.conn.Call(ctx, test.method, test.params)
 }
 
 func (test collect) Name() string { return test.name }

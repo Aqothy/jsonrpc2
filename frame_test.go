@@ -16,9 +16,9 @@ type mockRWC struct {
 
 func (m *mockRWC) Close() error { return nil }
 
-func TestRawFramer(t *testing.T) {
+func TestNdFramer(t *testing.T) {
 	ctx := context.Background()
-	framer := NewRawFramer()
+	framer := NewNdFramer()
 	buf := &bytes.Buffer{}
 	rwc := &mockRWC{Reader: buf, Writer: buf}
 	r, w := framer.Frame(rwc)
@@ -27,14 +27,43 @@ func TestRawFramer(t *testing.T) {
 	if err := w.Write(ctx, msg); err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
+	if got := buf.String(); got == "" || got[len(got)-1] != '\n' {
+		t.Fatalf("ND write = %q, want trailing newline", got)
+	}
 
 	readMsg, err := r.Read(ctx)
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)
 	}
-
 	if !reflect.DeepEqual(msg, readMsg) {
 		t.Errorf("expected %+v, got %+v", msg, readMsg)
+	}
+}
+
+func TestNdFramerRejectsMultilineMessage(t *testing.T) {
+	ctx := context.Background()
+	framer := NewNdFramer()
+	buf := bytes.NewBufferString(`{
+		"jsonrpc": "2.0",
+		"method": "test"
+	}` + "\n")
+	r, _ := framer.Frame(&mockRWC{Reader: buf, Writer: io.Discard})
+
+	_, err := r.Read(ctx)
+	if err == nil {
+		t.Fatal("expected multiline message to be rejected")
+	}
+}
+
+func TestNdFramerRequiresNewline(t *testing.T) {
+	ctx := context.Background()
+	framer := NewNdFramer()
+	buf := bytes.NewBufferString(`{"jsonrpc":"2.0","method":"test"}`)
+	r, _ := framer.Frame(&mockRWC{Reader: buf, Writer: io.Discard})
+
+	_, err := r.Read(ctx)
+	if err != io.ErrUnexpectedEOF {
+		t.Fatalf("Read error = %v, want %v", err, io.ErrUnexpectedEOF)
 	}
 }
 
@@ -78,40 +107,6 @@ func TestHeaderFramerInvalidContentLength(t *testing.T) {
 	_, err := r.Read(ctx)
 	if err == nil {
 		t.Error("expected error for invalid Content-Length, got nil")
-	}
-}
-
-func TestRawFramerMultiple(t *testing.T) {
-	ctx := context.Background()
-	framer := NewRawFramer()
-	buf := &bytes.Buffer{}
-	rwc := &mockRWC{Reader: buf, Writer: buf}
-	r, w := framer.Frame(rwc)
-
-	msg1, _ := NewNotification("test1", nil)
-	msg2, _ := NewNotification("test2", nil)
-
-	if err := w.Write(ctx, msg1); err != nil {
-		t.Fatalf("Write1 failed: %v", err)
-	}
-	if err := w.Write(ctx, msg2); err != nil {
-		t.Fatalf("Write2 failed: %v", err)
-	}
-
-	read1, err := r.Read(ctx)
-	if err != nil {
-		t.Fatalf("Read1 failed: %v", err)
-	}
-	if !reflect.DeepEqual(msg1, read1) {
-		t.Errorf("expected msg1 %+v, got %+v", msg1, read1)
-	}
-
-	read2, err := r.Read(ctx)
-	if err != nil {
-		t.Fatalf("Read2 failed: %v", err)
-	}
-	if !reflect.DeepEqual(msg2, read2) {
-		t.Errorf("expected msg2 %+v, got %+v", msg2, read2)
 	}
 }
 
@@ -162,29 +157,94 @@ func TestHeaderReaderEOF(t *testing.T) {
 	}
 }
 
-func TestReaderContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestMCPFramerWritesNewline(t *testing.T) {
+	ctx := context.Background()
+	framer := NewLineFramer()
+	buf := &bytes.Buffer{}
+	_, w := framer.Frame(&mockRWC{Reader: buf, Writer: buf})
 
-	framer := NewRawFramer()
-	r, _ := framer.Frame(&mockRWC{Reader: &bytes.Buffer{}, Writer: io.Discard})
-
-	_, err := r.Read(ctx)
-	if err != ctx.Err() {
-		t.Errorf("expected %v, got %v", ctx.Err(), err)
+	msg, _ := NewNotification("test", nil)
+	if err := w.Write(ctx, msg); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if got := buf.String(); got == "" || got[len(got)-1] != '\n' {
+		t.Fatalf("MCP write = %q, want trailing newline", got)
 	}
 }
 
-func TestWriterContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestMCPFramerMultiple(t *testing.T) {
+	ctx := context.Background()
+	framer := NewLineFramer()
+	buf := &bytes.Buffer{}
+	rwc := &mockRWC{Reader: buf, Writer: buf}
+	r, w := framer.Frame(rwc)
 
-	framer := NewRawFramer()
-	_, w := framer.Frame(&mockRWC{Reader: &bytes.Buffer{}, Writer: io.Discard})
+	msg1, _ := NewNotification("test1", nil)
+	msg2, _ := NewNotification("test2", nil)
 
-	msg, _ := NewNotification("test", nil)
-	err := w.Write(ctx, msg)
-	if err != ctx.Err() {
-		t.Errorf("expected %v, got %v", ctx.Err(), err)
+	if err := w.Write(ctx, msg1); err != nil {
+		t.Fatalf("Write1 failed: %v", err)
+	}
+	if err := w.Write(ctx, msg2); err != nil {
+		t.Fatalf("Write2 failed: %v", err)
+	}
+
+	read1, err := r.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read1 failed: %v", err)
+	}
+	if !reflect.DeepEqual(msg1, read1) {
+		t.Errorf("expected msg1 %+v, got %+v", msg1, read1)
+	}
+
+	read2, err := r.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read2 failed: %v", err)
+	}
+	if !reflect.DeepEqual(msg2, read2) {
+		t.Errorf("expected msg2 %+v, got %+v", msg2, read2)
+	}
+}
+
+func TestMCPFramerRejectsBatch(t *testing.T) {
+	ctx := context.Background()
+	framer := NewLineFramer()
+	buf := bytes.NewBufferString(`[{"jsonrpc":"2.0","method":"one"},{"jsonrpc":"2.0","method":"two"}]` + "\n")
+	r, _ := framer.Frame(&mockRWC{Reader: buf, Writer: io.Discard})
+
+	_, err := r.Read(ctx)
+	if err == nil {
+		t.Fatal("expected batch to be rejected")
+	}
+}
+
+func TestMCPFramerReadsMultilineMessage(t *testing.T) {
+	ctx := context.Background()
+	framer := NewLineFramer()
+	buf := bytes.NewBufferString(`{
+		"jsonrpc": "2.0",
+		"method": "test"
+	}` + "\n")
+	r, _ := framer.Frame(&mockRWC{Reader: buf, Writer: io.Discard})
+
+	msg, err := r.Read(ctx)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	req, ok := msg.(*Request)
+	if !ok || req.Method != "test" {
+		t.Fatalf("Read = %#v, want request with method test", msg)
+	}
+}
+
+func TestMCPFramerRejectsTrailingData(t *testing.T) {
+	ctx := context.Background()
+	framer := NewLineFramer()
+	buf := bytes.NewBufferString(`{"jsonrpc":"2.0","method":"test"}x` + "\n")
+	r, _ := framer.Frame(&mockRWC{Reader: buf, Writer: io.Discard})
+
+	_, err := r.Read(ctx)
+	if err == nil {
+		t.Fatal("expected trailing data to be rejected")
 	}
 }

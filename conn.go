@@ -10,27 +10,6 @@ import (
 	"sync/atomic"
 )
 
-// Binder builds a connection configuration.
-// This may be used in servers to generate a new configuration per connection.
-// ConnectionOptions itself implements Binder returning itself unmodified, to
-// allow for the simple cases where no per connection information is needed.
-type Binder interface {
-	// Bind returns the ConnectionOptions to use when establishing the passed-in
-	// Connection.
-	//
-	// The connection is not ready to use when Bind is called,
-	// but Bind may close it without reading or writing to it.
-	Bind(context.Context, *Connection) ConnectionOptions
-}
-
-type BinderFunc func(context.Context, *Connection) ConnectionOptions
-
-func (f BinderFunc) Bind(ctx context.Context, c *Connection) ConnectionOptions {
-	return f(ctx, c)
-}
-
-var _ Binder = BinderFunc(nil)
-
 // option for new connections
 type ConnectionOptions struct {
 	// Framer allows control over the message framing and encoding.
@@ -497,37 +476,6 @@ func (c *Connection) Close() error {
 	// connection) as soon as the active requests finish.
 	c.updateInFlight(func(s *inFlightState) { s.connClosing = true })
 	return c.Wait()
-}
-
-// high level, provides default header framer
-func bindConnection(bindCtx context.Context, rwc io.ReadWriteCloser, binder Binder, onDone func()) *Connection {
-	ctx := context.WithoutCancel(bindCtx)
-
-	c := &Connection{
-		state:  inFlightState{closer: rwc},
-		done:   make(chan struct{}),
-		writer: make(chan Writer, 1),
-		onDone: onDone,
-	}
-
-	options := binder.Bind(ctx, c)
-	framer := options.Framer
-	if framer == nil {
-		framer = NewHeaderFramer()
-	}
-
-	c.handler = options.Handler
-	if c.handler == nil {
-		c.handler = defaultHandler{}
-	}
-
-	c.onInternalError = options.OnInternalError
-	c.onNotificationError = options.OnNotificationError
-
-	reader, writer := framer.Frame(rwc)
-	c.writer <- writer
-	c.start(ctx, reader, options.Preempter)
-	return c
 }
 
 // inFlightState records the state of the incoming and outgoing calls on a
