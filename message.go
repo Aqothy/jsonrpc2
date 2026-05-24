@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // id can be either string, int or null according to specs, null id is discouraged
@@ -16,12 +17,22 @@ func MakeID(v any) (ID, error) {
 	switch v := v.(type) {
 	case nil:
 		return ID{}, nil
-	case float64:
-		return Int64ID(int64(v)), nil
+	case ID:
+		return v, nil
+	case json.Number:
+		return parseNumberID(v.String())
 	case string:
 		return StringID(v), nil
 	}
 	return ID{}, fmt.Errorf("%w: invalid ID type %T", ErrParse, v)
+}
+
+func parseNumberID(s string) (ID, error) {
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return ID{}, fmt.Errorf("%w: invalid numeric ID %q", ErrParse, s)
+	}
+	return Int64ID(i), nil
 }
 
 // MarshalJSON implements json.Marshaler.
@@ -31,16 +42,20 @@ func (id ID) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (id *ID) UnmarshalJSON(data []byte) error {
-	var v any
-	if err := json.Unmarshal(data, &v); err != nil {
-		return err
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*id = StringID(s)
+		return nil
 	}
-	newID, err := MakeID(v)
-	if err != nil {
-		return err
+
+	newID, err := parseNumberID(string(data))
+	if err == nil {
+		*id = newID
 	}
-	*id = newID
-	return nil
+	return err
 }
 
 // IsZero reports whether the ID is the zero value, for use with the omitzero JSON tag.
@@ -81,6 +96,19 @@ func Int64ID(i int64) ID { return ID{value: i} }
 
 // The default value for ID will return false.
 func (id ID) IsValid() bool { return id.value != nil }
+
+func (id ID) String() string {
+	switch v := id.value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return strconv.Quote(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	default:
+		return fmt.Sprint(v)
+	}
+}
 
 func (id ID) Raw() any { return id.value }
 
@@ -137,13 +165,21 @@ func toWireError(err error) *WireError {
 		// already a wire error, just use it
 		return err
 	}
-	result := &WireError{Message: err.Error()}
+	result := &WireError{Code: wireErrorCode(ErrUnknown), Message: err.Error()}
 	var wrapped *WireError
 	if errors.As(err, &wrapped) {
 		// looks inside error and if it finds a wrapped WireError, it uses the code from it
 		result.Code = wrapped.Code
 	}
 	return result
+}
+
+func wireErrorCode(err error) int64 {
+	var wire *WireError
+	if errors.As(err, &wire) {
+		return wire.Code
+	}
+	return 0
 }
 
 func EncodeMessage(msg Message) ([]byte, error) {

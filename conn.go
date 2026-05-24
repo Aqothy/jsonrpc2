@@ -29,6 +29,7 @@ type ConnectionOptions struct {
 	// handling notifications. Notifications cannot receive wire responses, so
 	// these errors are otherwise dropped.
 	OnNotificationError func(error)
+	OnDone              func()
 }
 
 // connection config for bidirectional jsonrpc2 connection
@@ -48,7 +49,7 @@ func (o ConnectionOptions) Bind(context.Context, *Connection) ConnectionOptions 
 	return o
 }
 
-// low level, provide everything yourself like reader, writer, etc, no framer provided
+// NewConnection creates a connection from fully constructed transport pieces.
 func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 	ctx = context.WithoutCancel(ctx)
 
@@ -61,11 +62,42 @@ func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 		onNotificationError: cfg.OnNotificationError,
 	}
 
-	c.handler = cfg.Bind(c)
+	if cfg.Bind != nil {
+		c.handler = cfg.Bind(c)
+	}
+	if c.handler == nil {
+		c.handler = defaultHandler{}
+	}
 	c.writer <- cfg.Writer
 	c.start(ctx, cfg.Reader, cfg.Preempter)
 
 	return c
+}
+
+// NewStreamConnection creates a connection over rwc using opts.Framer.
+// If opts.Framer is nil, NewHeaderFramer is used.
+func NewStreamConnection(ctx context.Context, rwc io.ReadWriteCloser, opts ConnectionOptions) *Connection {
+	framer := opts.Framer
+	if framer == nil {
+		framer = NewHeaderFramer()
+	}
+	handler := opts.Handler
+	if handler == nil {
+		handler = defaultHandler{}
+	}
+	reader, writer := framer.Frame(rwc)
+	return NewConnection(ctx, ConnectionConfig{
+		Reader:              reader,
+		Writer:              writer,
+		Closer:              rwc,
+		Preempter:           opts.Preempter,
+		OnDone:              opts.OnDone,
+		OnInternalError:     opts.OnInternalError,
+		OnNotificationError: opts.OnNotificationError,
+		Bind: func(*Connection) Handler {
+			return handler
+		},
+	})
 }
 
 // Connection manages the jsonrpc2 protocol, connecting responses back to their
@@ -129,18 +161,28 @@ func (c *Connection) Call(ctx context.Context, method string, params any) *Pendi
 	}
 
 	if err := c.write(ctx, call); err != nil {
-		c.updateInFlight(func(s *inFlightState) {
-			if s.outgoingCalls[ac.id] == ac {
-				delete(s.outgoingCalls, ac.id)
-				ac.retire(&Response{ID: id, Error: err})
-			} else {
-				// ac was already retired by the readIncoming goroutine:
-				// perhaps our write raced with the Read side of the connection breaking.
-			}
-		})
+		c.Retire(ac, err)
 	}
 
 	return ac
+}
+
+// Retire stops tracking ac and completes it locally with err.
+//
+// Retire is useful when the caller has abandoned a call, usually because its
+// Await context was canceled, and does not want connection shutdown to wait for
+// a response that is no longer useful. If the peer later sends the real
+// response, the connection will treat it as an unexpected response.
+func (c *Connection) Retire(ac *PendingCall, err error) {
+	if ac == nil {
+		return
+	}
+	c.updateInFlight(func(s *inFlightState) {
+		if s.outgoingCalls[ac.id] == ac {
+			delete(s.outgoingCalls, ac.id)
+			ac.retire(&Response{ID: ac.id, Error: err})
+		}
+	})
 }
 
 // Reponds to incoming call.
@@ -153,7 +195,7 @@ func (c *Connection) Respond(id ID, result any, err error) error {
 		return c.internalErrorf("Request not found for ID %v", id)
 	}
 
-	if err == ErrAsyncResponse {
+	if errors.Is(err, ErrAsyncResponse) {
 		err = c.internalErrorf("Respond called with ErrAsyncReponse for %q", req.Method)
 	}
 
@@ -184,9 +226,9 @@ func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter 
 				s.incomingByID = make(map[ID]*incomingRequest)
 			}
 			s.incomingByID[req.ID] = req
-		}
 
-		err = s.shouldShutDown(ErrServerClosing)
+			err = s.shouldShutDown(ErrServerClosing)
+		}
 	})
 
 	if err != nil {
@@ -224,27 +266,38 @@ func (c *Connection) acceptRequest(ctx context.Context, msg *Request, preempter 
 }
 
 func (c *Connection) processResult(from any, req *incomingRequest, result any, err error) error {
-	switch err {
-	case ErrAsyncResponse:
-		if !req.IsCall() {
-			return c.internalErrorf("%#v returned ErrAsyncResponse for a %q Request without an ID", from, req.Method)
+	var retErr error
+	switch {
+	case errors.Is(err, ErrAsyncResponse):
+		if req.IsCall() {
+			return nil
 		}
-		return nil
-	case ErrNotHandled, ErrMethodNotFound:
+		err = c.internalErrorf("%#v returned ErrAsyncResponse for a %q Request without an ID", from, req.Method)
+		retErr = errors.Join(retErr, err)
+	case errors.Is(err, ErrNotHandled), errors.Is(err, ErrMethodNotFound):
 		err = fmt.Errorf("%w: %q", ErrMethodNotFound, req.Method)
 	}
 
 	if result != nil && err != nil {
-		c.internalErrorf("%#v returned a non-nil result with a non-nil error for %s:\n%v\n%#v", from, req.Method, err, result)
+		retErr = errors.Join(retErr, c.internalErrorf("%#v returned a non-nil result with a non-nil error for %s:\n%v\n%#v", from, req.Method, err, result))
 		result = nil // Discard the spurious result and respond with err.
 	}
 
 	if req.IsCall() {
 		if result == nil && err == nil {
 			err = c.internalErrorf("%#v returned a nil result and nil error for a %q Request that requires a Response", from, req.Method)
+			retErr = errors.Join(retErr, err)
 		}
 
 		res, respErr := NewResponse(req.ID, result, err)
+		if respErr != nil {
+			err = c.internalErrorf("%#v returned a malformed result for %q: %w", from, req.Method, respErr)
+			retErr = errors.Join(retErr, err)
+			res, respErr = NewResponse(req.ID, nil, err)
+			if respErr != nil {
+				retErr = errors.Join(retErr, c.internalErrorf("failed to marshal internal error response for %q: %w", req.Method, respErr))
+			}
+		}
 
 		c.updateInFlight(func(s *inFlightState) {
 			delete(s.incomingByID, req.ID)
@@ -252,17 +305,17 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 
 		if respErr == nil {
 			writerErr := c.write(context.WithoutCancel(req.ctx), res)
-			if err == nil {
-				err = writerErr
+			if writerErr != nil {
+				retErr = errors.Join(retErr, writerErr)
 			}
-		} else {
-			err = c.internalErrorf("%#v returned a malformed result for %q: %w", from, req.Method, respErr)
 		}
 	} else { // req is a notification
 		if result != nil {
 			err = c.internalErrorf("%#v returned a non-nil result for a %q Request without an ID", from, req.Method)
+			retErr = errors.Join(retErr, err)
 		} else if err != nil {
 			err = fmt.Errorf("%w: %q notification failed: %v", ErrInternal, req.Method, err)
+			retErr = errors.Join(retErr, err)
 		}
 		if err != nil {
 			c.reportNotificationError(err)
@@ -278,7 +331,7 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 		s.incoming--
 	})
 
-	return nil
+	return retErr
 }
 
 func (c *Connection) handleAsync() {
@@ -463,10 +516,24 @@ func (c *Connection) Cancel(id ID) {
 
 // Wait blocks until the connection is fully closed, but does not close it.
 func (c *Connection) Wait() error {
+	return c.wait(true)
+}
+
+func (c *Connection) wait(reportIOErrors bool) error {
 	var err error
 	<-c.done
 	c.updateInFlight(func(s *inFlightState) {
-		err = s.closeErr
+		if reportIOErrors {
+			if !errors.Is(s.readErr, io.EOF) {
+				err = s.readErr
+			}
+			if err == nil && !errors.Is(s.writeErr, io.EOF) {
+				err = s.writeErr
+			}
+		}
+		if err == nil {
+			err = s.closeErr
+		}
 	})
 	return err
 }
@@ -475,7 +542,7 @@ func (c *Connection) Close() error {
 	// Stop handling new requests, and interrupt the reader (by closing the
 	// connection) as soon as the active requests finish.
 	c.updateInFlight(func(s *inFlightState) { s.connClosing = true })
-	return c.Wait()
+	return c.wait(false)
 }
 
 // inFlightState records the state of the incoming and outgoing calls on a

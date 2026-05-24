@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	jsonrpc2 "github.com/Aqothy/jsonrpc2"
 )
@@ -363,5 +364,203 @@ func (h *handler) Handle(ctx context.Context, req *jsonrpc2.Request) (any, error
 		return nil, jsonrpc2.ErrAsyncResponse
 	default:
 		return nil, jsonrpc2.ErrNotHandled
+	}
+}
+
+type streamReadResult struct {
+	msg jsonrpc2.Message
+	err error
+}
+
+type streamChannelReader struct {
+	ch <-chan streamReadResult
+}
+
+func (r *streamChannelReader) Read(context.Context) (jsonrpc2.Message, error) {
+	v := <-r.ch
+	return v.msg, v.err
+}
+
+type captureTestWriter struct {
+	ch chan jsonrpc2.Message
+}
+
+func newCaptureTestWriter() *captureTestWriter {
+	return &captureTestWriter{ch: make(chan jsonrpc2.Message, 8)}
+}
+
+func (w *captureTestWriter) Write(ctx context.Context, msg jsonrpc2.Message) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case w.ch <- msg:
+		return nil
+	}
+}
+
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
+
+func TestWaitReturnsReadError(t *testing.T) {
+	readErr := errors.New("read failed")
+	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
+		Reader: &streamChannelReader{ch: closedStreamReadResults(streamReadResult{err: readErr})},
+		Writer: discardWriter{},
+		Closer: closeFunc(func() error { return nil }),
+	})
+
+	if err := conn.Wait(); !errors.Is(err, readErr) {
+		t.Fatalf("Wait() = %v, want %v", err, readErr)
+	}
+}
+
+func TestMalformedHandlerResultSendsInternalErrorResponse(t *testing.T) {
+	writer := newCaptureTestWriter()
+	reported := make(chan error, 1)
+	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
+		Reader: &streamChannelReader{ch: closedStreamReadResults(
+			streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "bad"}},
+			streamReadResult{err: io.EOF},
+		)},
+		Writer:          writer,
+		Closer:          closeFunc(func() error { return nil }),
+		OnInternalError: func(err error) { reported <- err },
+		Bind: func(*jsonrpc2.Connection) jsonrpc2.Handler {
+			return jsonrpc2.HandlerFunc(func(context.Context, *jsonrpc2.Request) (any, error) {
+				return func() {}, nil
+			})
+		},
+	})
+	if err := conn.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := <-writer.ch
+	resp, ok := msg.(*jsonrpc2.Response)
+	if !ok {
+		t.Fatalf("wrote %T, want *Response", msg)
+	}
+	if !errors.Is(resp.Error, jsonrpc2.ErrInternal) {
+		t.Fatalf("response error = %v, want ErrInternal", resp.Error)
+	}
+	select {
+	case err := <-reported:
+		if !strings.Contains(err.Error(), "malformed result") {
+			t.Fatalf("reported error = %v, want malformed result", err)
+		}
+	default:
+		t.Fatal("expected internal error report")
+	}
+}
+
+func TestRetireAllowsCloseAfterCanceledAwait(t *testing.T) {
+	readerClosed := make(chan struct{})
+	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
+		Reader: &blockingTestReader{closed: readerClosed},
+		Writer: discardWriter{},
+		Closer: closeFunc(func() error {
+			close(readerClosed)
+			return nil
+		}),
+	})
+
+	call := conn.Call(context.Background(), "slow", nil)
+	conn.Retire(call, context.Canceled)
+	if err := call.Await(context.Background(), nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Await() = %v, want context.Canceled", err)
+	}
+	assertCompletes(t, conn.Close)
+}
+
+func TestCloseStillPreemptsNotifications(t *testing.T) {
+	reads := make(chan streamReadResult, 2)
+	preempted := make(chan struct{}, 1)
+	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
+		Reader: &streamChannelReader{ch: reads},
+		Writer: discardWriter{},
+		Closer: closeFunc(func() error { return nil }),
+		Preempter: jsonrpc2.PreempterFunc(func(ctx context.Context, req *jsonrpc2.Request) (any, error) {
+			if req.Method == "cancel" {
+				preempted <- struct{}{}
+				return nil, nil
+			}
+			return nil, jsonrpc2.ErrNotHandled
+		}),
+		OnNotificationError: func(error) {},
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- conn.Close() }()
+	reads <- streamReadResult{msg: &jsonrpc2.Request{Method: "cancel"}}
+	reads <- streamReadResult{err: io.EOF}
+
+	select {
+	case <-preempted:
+	case <-time.After(time.Second):
+		t.Fatal("notification was not preempted during close")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+}
+
+func TestGenericErrorEncodesUnknownCode(t *testing.T) {
+	msg, err := jsonrpc2.NewResponse(jsonrpc2.Int64ID(1), nil, errors.New("boom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := jsonrpc2.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := jsonrpc2.DecodeMessage(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, ok := decoded.(*jsonrpc2.Response)
+	if !ok {
+		t.Fatalf("decoded %T, want *Response", decoded)
+	}
+	if !errors.Is(resp.Error, jsonrpc2.ErrUnknown) {
+		t.Fatalf("response error = %v, want ErrUnknown", resp.Error)
+	}
+}
+
+func TestDecodeRejectsFractionalID(t *testing.T) {
+	_, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","id":1.5,"method":"x"}`))
+	if !errors.Is(err, jsonrpc2.ErrParse) {
+		t.Fatalf("DecodeMessage fractional ID error = %v, want ErrParse", err)
+	}
+}
+
+type blockingTestReader struct {
+	closed <-chan struct{}
+}
+
+func (r *blockingTestReader) Read(context.Context) (jsonrpc2.Message, error) {
+	<-r.closed
+	return nil, io.EOF
+}
+
+func closedStreamReadResults(results ...streamReadResult) <-chan streamReadResult {
+	ch := make(chan streamReadResult, len(results))
+	for _, result := range results {
+		ch <- result
+	}
+	return ch
+}
+
+func assertCompletes(t *testing.T, f func() error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("operation did not complete")
 	}
 }
