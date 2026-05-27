@@ -13,6 +13,21 @@ go get github.com/Aqothy/jsonrpc2
 - ACP stdio: one UTF-8 JSON-RPC message per newline with no embedded newlines, use `NewNdFramer`.
 - WebSocket: one JSON-RPC message per text WebSocket message, use `NewWebSocketConnection` with an adapter.
 
+## Differences from Go tools's internal jsonrpc2_v2
+
+This package is based on Go's `golang.org/x/tools/internal/jsonrpc2_v2`, with
+several changes adapted for my usage, only including what I need and
+extracted to be used as a standalone library
+
+- Added newline-delimited framing with `NewNdFramer` for MCP/ACP-style stdio transports.
+- Added WebSocket transport helpers via a small adapter interface.
+- Resolved all TODO from the original implementation
+- Using newer golang apis
+
+## Future plans
+
+- [] maybe support batching (not used in any protocols as of right now)
+
 ## LSP over stdio
 
 LSP uses `Content-Length` headers. `NewHeaderFramer` is the default for `NewStreamConnection`, but it is shown explicitly here.
