@@ -284,11 +284,6 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 	}
 
 	if req.IsCall() {
-		if result == nil && err == nil {
-			err = c.internalErrorf("%#v returned a nil result and nil error for a %q Request that requires a Response", from, req.Method)
-			retErr = errors.Join(retErr, err)
-		}
-
 		res, respErr := NewResponse(req.ID, result, err)
 		if respErr != nil {
 			err = c.internalErrorf("%#v returned a malformed result for %q: %w", from, req.Method, respErr)

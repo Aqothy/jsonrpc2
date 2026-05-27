@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/textproto"
@@ -23,62 +22,8 @@ type Framer interface {
 	Frame(io.ReadWriteCloser) (Reader, Writer)
 }
 
-// new line framer for MCP, allows for multiline/pretty-printed json
-type lineFramer struct{}
-
-type lineReader struct {
-	in *json.Decoder
-}
-
-type lineWriter struct {
-	out io.Writer
-}
-
-func NewLineFramer() Framer { return lineFramer{} }
-
-func (f lineFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
-	return &lineReader{json.NewDecoder(rwc)}, &lineWriter{out: rwc}
-}
-
-func (r *lineReader) Read(ctx context.Context) (Message, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	var raw json.RawMessage
-	if err := r.in.Decode(&raw); err != nil {
-		return nil, err
-	}
-	var tr [1]byte
-	if n, err := r.in.Buffered().Read(tr[:]); n > 0 {
-		if tr[0] != '\n' && tr[0] != '\r' {
-			return nil, fmt.Errorf("invalid trailing data after JSON-RPC message")
-		}
-	} else if err != nil && err != io.EOF {
-		return nil, err
-	}
-	return DecodeMessage(raw)
-}
-
-func (w *lineWriter) Write(ctx context.Context, msg Message) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	data, err := EncodeMessage(msg)
-	if err != nil {
-		return fmt.Errorf("marshaling message: %v", err)
-	}
-	data = append(data, '\n')
-
-	_, err = w.out.Write(data)
-	return err
-}
-
-// new line delimited framer for ACP
+// strict newline-delimited framer for protocols like MCP stdio and ACP stdio.
+// It requires exactly one complete JSON-RPC message per line.
 type ndFramer struct{}
 
 type ndReader struct {

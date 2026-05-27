@@ -36,12 +36,12 @@ const RPCVersion = "2.0"
 // we combine them since jsonrpc 2 can send both so we don't know which
 // we used a combined struct so we can decode and check which it is
 type wireCombined struct {
-	RPCVersion string           `json:"jsonrpc"`
-	ID         ID               `json:"id,omitzero"`
-	Method     string           `json:"method,omitempty"`
-	Params     json.RawMessage  `json:"params,omitempty"`
-	Result     *json.RawMessage `json:"result,omitempty"`
-	Error      *WireError       `json:"error,omitempty"`
+	RPCVersion string          `json:"jsonrpc"`
+	ID         ID              `json:"id,omitzero"`
+	Method     string          `json:"method,omitempty"`
+	Params     json.RawMessage `json:"params,omitempty"`
+	Result     json.RawMessage `json:"result,omitempty"`
+	Error      *WireError      `json:"error,omitempty"`
 }
 
 // Error from response

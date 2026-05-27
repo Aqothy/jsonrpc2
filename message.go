@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 )
 
-// id can be either string, int or null according to specs, null id is discouraged
-// null and missing ids will be treated the same and as notifications
+// id can be either string or int. JSON-RPC permits null IDs, but they are discouraged and not supported.
+// A zero ID means the id member is absent; JSON null IDs are decoded as zero IDs.
 type ID struct {
 	value any
 }
 
+// MakeID coerces a JSON-RPC id value into an ID. A nil value means no ID.
 func MakeID(v any) (ID, error) {
 	switch v := v.(type) {
 	case nil:
@@ -23,6 +25,16 @@ func MakeID(v any) (ID, error) {
 		return parseNumberID(v.String())
 	case string:
 		return StringID(v), nil
+	case float64:
+		const maxSafeInteger = 1 << 53
+		if math.Trunc(v) != v || v < -maxSafeInteger || v > maxSafeInteger {
+			return ID{}, fmt.Errorf("%w: invalid numeric ID %v", ErrParse, v)
+		}
+		return Int64ID(int64(v)), nil
+	case int:
+		return Int64ID(int64(v)), nil
+	case int64:
+		return Int64ID(v), nil
 	}
 	return ID{}, fmt.Errorf("%w: invalid ID type %T", ErrParse, v)
 }
@@ -42,6 +54,10 @@ func (id ID) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (id *ID) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*id = ID{}
+		return nil
+	}
 	if len(data) > 0 && data[0] == '"' {
 		var s string
 		if err := json.Unmarshal(data, &s); err != nil {
@@ -100,7 +116,7 @@ func (id ID) IsValid() bool { return id.value != nil }
 func (id ID) String() string {
 	switch v := id.value.(type) {
 	case nil:
-		return "null"
+		return "<missing>"
 	case string:
 		return strconv.Quote(v)
 	case int64:
@@ -110,6 +126,7 @@ func (id ID) String() string {
 	}
 }
 
+// Raw returns the underlying Go value for the ID. For the zero ID, Raw returns nil.
 func (id ID) Raw() any { return id.value }
 
 func marshalToRaw(obj any) (json.RawMessage, error) {
@@ -142,18 +159,30 @@ func (msg *Request) marshal(to *wireCombined) {
 	to.Params = msg.Params
 }
 
+// NewResponse constructs a response. If resErr is nil and result is nil,
+// the response is a successful JSON-RPC response with result:null.
 func NewResponse(id ID, result any, resErr error) (*Response, error) {
+	if resErr != nil {
+		return &Response{ID: id, Error: resErr}, nil
+	}
+	if result == nil {
+		return &Response{ID: id, Result: json.RawMessage("null")}, nil
+	}
 	responseRaw, err := marshalToRaw(result)
-	return &Response{ID: id, Result: responseRaw, Error: resErr}, err
+	return &Response{ID: id, Result: responseRaw}, err
 }
 
 func (msg *Response) marshal(to *wireCombined) {
 	to.ID = msg.ID
-	if msg.Result != nil {
-		result := msg.Result
-		to.Result = &result
+	if msg.Error != nil {
+		to.Error = toWireError(msg.Error)
+		return
 	}
-	to.Error = toWireError(msg.Error)
+	if msg.Result == nil {
+		to.Result = json.RawMessage("null")
+	} else {
+		to.Result = msg.Result
+	}
 }
 
 func toWireError(err error) *WireError {
@@ -226,7 +255,7 @@ func DecodeMessage(data []byte) (Message, error) {
 		ID: msg.ID,
 	}
 	if hasResult {
-		resp.Result = *msg.Result
+		resp.Result = msg.Result
 	} else {
 		resp.Error = msg.Error
 	}

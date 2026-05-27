@@ -505,6 +505,124 @@ func TestCloseStillPreemptsNotifications(t *testing.T) {
 	}
 }
 
+func TestNullResultResponseRoundTrip(t *testing.T) {
+	msg, err := jsonrpc2.NewResponse(jsonrpc2.Int64ID(1), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := jsonrpc2.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"result":null`) {
+		t.Fatalf("encoded response = %s, want result:null", data)
+	}
+	decoded, err := jsonrpc2.DecodeMessage(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, ok := decoded.(*jsonrpc2.Response)
+	if !ok {
+		t.Fatalf("decoded %T, want *Response", decoded)
+	}
+	if string(resp.Result) != "null" || resp.Error != nil {
+		t.Fatalf("decoded response = %#v, want null result and no error", resp)
+	}
+}
+
+func TestDecodeNullRequestIDAsMissing(t *testing.T) {
+	msg, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","id":null,"method":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, ok := msg.(*jsonrpc2.Request)
+	if !ok {
+		t.Fatalf("decoded %T, want *Request", msg)
+	}
+	if req.IsCall() {
+		t.Fatal("null request ID should be treated as missing")
+	}
+}
+
+func TestDecodeRejectsNullResponseID(t *testing.T) {
+	_, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","id":null,"result":null}`))
+	if !errors.Is(err, jsonrpc2.ErrInvalidRequest) {
+		t.Fatalf("DecodeMessage null response ID error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestMissingIDIsNotification(t *testing.T) {
+	msg, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","method":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, ok := msg.(*jsonrpc2.Request)
+	if !ok {
+		t.Fatalf("decoded %T, want *Request", msg)
+	}
+	if req.IsCall() {
+		t.Fatal("missing request ID should be a notification")
+	}
+	data, err := jsonrpc2.EncodeMessage(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"id"`) {
+		t.Fatalf("encoded notification = %s, want no id member", data)
+	}
+}
+
+func TestHandlerNilResultSendsNullResult(t *testing.T) {
+	writer := newCaptureTestWriter()
+	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
+		Reader: &streamChannelReader{ch: closedStreamReadResults(
+			streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "null"}},
+			streamReadResult{err: io.EOF},
+		)},
+		Writer: writer,
+		Closer: closeFunc(func() error { return nil }),
+		Bind: func(*jsonrpc2.Connection) jsonrpc2.Handler {
+			return jsonrpc2.HandlerFunc(func(context.Context, *jsonrpc2.Request) (any, error) {
+				return nil, nil
+			})
+		},
+	})
+	if err := conn.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	resp, ok := (<-writer.ch).(*jsonrpc2.Response)
+	if !ok {
+		t.Fatal("wrote non-response")
+	}
+	if string(resp.Result) != "null" || resp.Error != nil {
+		t.Fatalf("response = %#v, want result:null", resp)
+	}
+}
+
+func TestResponseMarshalFillsNullResult(t *testing.T) {
+	data, err := jsonrpc2.EncodeMessage(&jsonrpc2.Response{ID: jsonrpc2.Int64ID(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"result":null`) {
+		t.Fatalf("encoded response = %s, want result:null", data)
+	}
+}
+
+func TestResponseMarshalErrorOmitsResult(t *testing.T) {
+	data, err := jsonrpc2.EncodeMessage(&jsonrpc2.Response{
+		ID:     jsonrpc2.Int64ID(1),
+		Result: json.RawMessage(`"ignored"`),
+		Error:  errors.New("boom"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"result"`) {
+		t.Fatalf("encoded response = %s, want error response without result", data)
+	}
+}
+
 func TestGenericErrorEncodesUnknownCode(t *testing.T) {
 	msg, err := jsonrpc2.NewResponse(jsonrpc2.Int64ID(1), nil, errors.New("boom"))
 	if err != nil {
@@ -524,6 +642,37 @@ func TestGenericErrorEncodesUnknownCode(t *testing.T) {
 	}
 	if !errors.Is(resp.Error, jsonrpc2.ErrUnknown) {
 		t.Fatalf("response error = %v, want ErrUnknown", resp.Error)
+	}
+}
+
+func TestMakeID(t *testing.T) {
+	id, err := jsonrpc2.MakeID(nil)
+	if err != nil {
+		t.Fatalf("MakeID(nil) failed: %v", err)
+	}
+	if id.IsValid() {
+		t.Fatalf("MakeID(nil) = %s valid:true, want missing ID", id.String())
+	}
+
+	tests := []struct {
+		in   any
+		want string
+	}{
+		{float64(3), "3"},
+		{int64(4), "4"},
+		{"x", `"x"`},
+	}
+	for _, test := range tests {
+		id, err := jsonrpc2.MakeID(test.in)
+		if err != nil {
+			t.Fatalf("MakeID(%#v) failed: %v", test.in, err)
+		}
+		if !id.IsValid() || id.String() != test.want {
+			t.Fatalf("MakeID(%#v) = %s valid:%v, want %s valid:true", test.in, id.String(), id.IsValid(), test.want)
+		}
+	}
+	if _, err := jsonrpc2.MakeID(float64(1.5)); !errors.Is(err, jsonrpc2.ErrParse) {
+		t.Fatalf("MakeID(1.5) = %v, want ErrParse", err)
 	}
 }
 

@@ -47,7 +47,7 @@ type Handler interface {
 	// and any error may be logged but will not be reported to the caller.
 	//
 	// If the Request has a non-nil ID, Handle must return either a
-	// non-nil, JSON-marshalable result, or a non-nil error.
+	// JSON-marshalable result (nil is encoded as JSON null), or a non-nil error.
 	//
 	// The Context passed to Handle will be canceled if the
 	// connection is broken or the request is canceled or completed.
