@@ -109,7 +109,7 @@ func NewStreamConnection(ctx context.Context, rwc io.ReadWriteCloser, opts Conne
 // Connection is bidirectional; it does not have a designated server or client
 // end.
 type Connection struct {
-	seq int64 // must only be accessed using atomic operations
+	seq atomic.Int64 // must only be accessed using atomic operations
 
 	stateMu sync.Mutex
 	state   inFlightState // accessed only in updateInFlight
@@ -129,7 +129,7 @@ type Connection struct {
 // You dont have to wait for resopnse, can be ignored if not needed
 // If sending call failed then resopnse will be ready and have the error in it
 func (c *Connection) Call(ctx context.Context, method string, params any) *PendingCall {
-	id := Int64ID((atomic.AddInt64(&c.seq, 1)))
+	id := Int64ID((c.seq.Add(1)))
 
 	ac := &PendingCall{
 		id:    id,
