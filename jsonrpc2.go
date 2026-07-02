@@ -33,7 +33,7 @@ type Preempter interface {
 	Preempt(ctx context.Context, req *Request) (result any, err error)
 }
 
-// compile check to make sure the interface hasnt implementation is still valid
+// PreempterFunc adapts a function to the Preempter interface.
 type PreempterFunc func(ctx context.Context, req *Request) (result any, err error)
 
 func (f PreempterFunc) Preempt(ctx context.Context, req *Request) (any, error) {

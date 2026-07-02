@@ -48,11 +48,6 @@ type ConnectionConfig struct {
 	OnNotificationError func(error)
 }
 
-// Bind returns the options unmodified.
-func (o ConnectionOptions) Bind(context.Context, *Connection) ConnectionOptions {
-	return o
-}
-
 // NewConnection creates a connection from fully constructed transport pieces.
 func NewConnection(ctx context.Context, cfg ConnectionConfig) *Connection {
 	ctx = context.WithoutCancel(ctx)
@@ -126,10 +121,10 @@ type Connection struct {
 
 // Invokes target method and returns PendingCall which can be used to await the
 // response
-// You dont have to wait for resopnse, can be ignored if not needed
-// If sending call failed then resopnse will be ready and have the error in it
+// You don't have to wait for the response, it can be ignored if not needed
+// If sending the call failed then the response will be ready and have the error in it
 func (c *Connection) Call(ctx context.Context, method string, params any) *PendingCall {
-	id := Int64ID((c.seq.Add(1)))
+	id := Int64ID(c.seq.Add(1))
 
 	ac := &PendingCall{
 		id:    id,
@@ -142,7 +137,7 @@ func (c *Connection) Call(ctx context.Context, method string, params any) *Pendi
 
 	call, err := NewCall(ac.id, method, params)
 	if err != nil {
-		ac.retire(&Response{ID: id, Error: fmt.Errorf("marshalling call parameters: %w", err)})
+		ac.retire(&Response{ID: id, Error: fmt.Errorf("marshaling call parameters: %w", err)})
 		return ac
 	}
 
@@ -189,7 +184,7 @@ func (c *Connection) Retire(ac *PendingCall, err error) {
 	})
 }
 
-// Reponds to incoming call.
+// Responds to an incoming call.
 func (c *Connection) Respond(id ID, result any, err error) error {
 	var req *incomingRequest
 	c.updateInFlight(func(s *inFlightState) {
@@ -200,7 +195,7 @@ func (c *Connection) Respond(id ID, result any, err error) error {
 	}
 
 	if errors.Is(err, ErrAsyncResponse) {
-		err = c.internalErrorf("Respond called with ErrAsyncReponse for %q", req.Method)
+		err = c.internalErrorf("Respond called with ErrAsyncResponse for %q", req.Method)
 	}
 
 	return c.processResult("Respond", req, result, err)
@@ -324,7 +319,6 @@ func (c *Connection) processResult(from any, req *incomingRequest, result any, e
 	req.cancel(context.Canceled)
 	c.updateInFlight(func(s *inFlightState) {
 		if s.incoming == 0 {
-
 			panic("jsonrpc2_v2: processResult called when incoming count is already zero")
 		}
 		s.incoming--
@@ -428,7 +422,12 @@ func (c *Connection) start(ctx context.Context, reader Reader, preempter Preempt
 }
 
 func (c *Connection) write(ctx context.Context, msg Message) error {
-	writer := <-c.writer
+	var writer Writer
+	select {
+	case writer = <-c.writer:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	defer func() { c.writer <- writer }()
 	err := writer.Write(ctx, msg)
 
@@ -451,7 +450,7 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 	return err
 }
 
-// Notify invokes the target method, has no id and doesn't expact response.
+// Notify invokes the target method, has no id and doesn't expect a response.
 func (c *Connection) Notify(ctx context.Context, method string, params any) (err error) {
 	attempted := false
 
@@ -481,7 +480,7 @@ func (c *Connection) Notify(ctx context.Context, method string, params any) (err
 
 	notify, err := NewNotification(method, params)
 	if err != nil {
-		return fmt.Errorf("marshaling notify parameters: %v", err)
+		return fmt.Errorf("marshaling notify parameters: %w", err)
 	}
 
 	return c.write(ctx, notify)
@@ -622,8 +621,12 @@ func (c *Connection) updateInFlight(f func(*inFlightState)) {
 			s.closer = nil
 		}
 		if s.reading {
-
+			// The readIncoming goroutine is still running. Our call to Close should
+			// cause it to exit soon, at which point it will make another call to
+			// updateInFlight, set s.reading to false, and mark the Connection done.
 		} else {
+			// The readIncoming goroutine has exited, or never started to begin with.
+			// Since everything else is idle, we're completely done.
 			if c.onDone != nil {
 				c.onDone()
 			}

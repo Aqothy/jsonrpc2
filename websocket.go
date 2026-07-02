@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// WS doesnt need framing as its already message oriented
+// WS doesn't need framing as it's already message oriented
 // Adapters for concrete websocket libraries should reject non-text websocket
 // messages before returning data from ReadMessage.
 type WebSocket interface {
