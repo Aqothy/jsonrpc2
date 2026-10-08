@@ -36,16 +36,32 @@ var (
 
 const RPCVersion = "2.0"
 
-// combination of request and response
-// we combine them since jsonrpc 2 can send both so we don't know which
-// we used a combined struct so we can decode and check which it is
-type wireCombined struct {
+// wireRequest is an outgoing call or notification; notifications omit the id.
+type wireRequest struct {
 	RPCVersion string          `json:"jsonrpc"`
 	ID         ID              `json:"id,omitzero"`
-	Method     string          `json:"method,omitempty"`
+	Method     string          `json:"method"`
 	Params     json.RawMessage `json:"params,omitempty"`
+}
+
+// wireResponse is an outgoing response. The id is always present: JSON-RPC
+// requires null when the request's id could not be determined.
+type wireResponse struct {
+	RPCVersion string          `json:"jsonrpc"`
+	ID         ID              `json:"id"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      *WireError      `json:"error,omitempty"`
+}
+
+// wireIncoming decodes any incoming message. Members are raw so a missing
+// member can be told apart from an explicit null.
+type wireIncoming struct {
+	RPCVersion *string         `json:"jsonrpc"`
+	ID         json.RawMessage `json:"id"`
+	Method     *string         `json:"method"`
+	Params     json.RawMessage `json:"params"`
+	Result     json.RawMessage `json:"result"`
+	Error      json.RawMessage `json:"error"`
 }
 
 // Error from response
@@ -70,7 +86,7 @@ func (err *WireError) Error() string {
 // checks if error and code are the same
 func (err *WireError) Is(other error) bool {
 	w, ok := other.(*WireError)
-	if !ok {
+	if !ok || w == nil {
 		return false
 	}
 	return err.Code == w.Code

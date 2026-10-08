@@ -350,11 +350,43 @@ func (c *Connection) handleAsync() {
 			continue
 		}
 
-		result, err := c.handler.Handle(req.ctx, req.Request)
-		c.processResult(c.handler, req, result, err)
+		// The handler runs on its own goroutine, but the queue stays blocked
+		// until it returns or calls Async, so handlers start in wire order and
+		// can finish ordering-sensitive work before the next message is seen.
+		r := &releaser{ch: make(chan struct{})}
+		ctx := context.WithValue(req.ctx, asyncKey{}, r)
+		go func() {
+			defer r.release()
+			result, err := c.handler.Handle(ctx, req.Request)
+			c.processResult(c.handler, req, result, err)
+		}()
+		<-r.ch
 	}
-
 }
+
+// Async lets the connection hand the next queued message to the Handler while
+// the request whose context is ctx keeps running. Until Async is called (or
+// Handle returns), messages are handled strictly one at a time in the order
+// they arrived. Call it once any work that must happen before later messages
+// are seen is done, e.g. right away for a long-running call.
+//
+// Async has no effect on contexts that are not from a Handle call, and later
+// calls on the same request are no-ops.
+func Async(ctx context.Context) {
+	if r, ok := ctx.Value(asyncKey{}).(*releaser); ok {
+		r.release()
+	}
+}
+
+type asyncKey struct{}
+
+// releaser unblocks the handler queue exactly once.
+type releaser struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (r *releaser) release() { r.once.Do(func() { close(r.ch) }) }
 
 func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter Preempter) {
 	var err error
@@ -362,6 +394,15 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter 
 	for {
 		var msg Message
 		msg, err = reader.Read(ctx)
+		if isMalformedMessage(err) {
+			// The transport is intact but this frame is not a usable message.
+			// JSON-RPC requires answering with a null id; keep reading.
+			if writeErr := c.write(ctx, &Response{Error: err}); writeErr != nil {
+				err = writeErr
+				break
+			}
+			continue
+		}
 		if err != nil {
 			break
 		}
@@ -382,7 +423,11 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter 
 				}
 			})
 			if unexpected {
-				c.internalErrorf("received response for unknown request ID %v", msg.ID)
+				if msg.Error != nil {
+					c.internalErrorf("received error response for unknown request ID %v: %v", msg.ID, msg.Error)
+				} else {
+					c.internalErrorf("received response for unknown request ID %v", msg.ID)
+				}
 			}
 
 		default:
@@ -400,7 +445,21 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter 
 			ac.retire(&Response{ID: id, Error: err})
 		}
 		s.outgoingCalls = nil
+
+		// Cancel incoming requests still in flight: with the reader gone the
+		// peer can no longer cancel them, and is most likely gone, so parked
+		// handlers have nothing useful left to do.
+		cause := fmt.Errorf("%w: %w", ErrServerClosing, err)
+		for _, r := range s.incomingByID {
+			r.cancel(cause)
+		}
 	})
+}
+
+// isMalformedMessage reports whether a Reader error rejects a single message
+// (see DecodeMessage) rather than the transport.
+func isMalformedMessage(err error) bool {
+	return errors.Is(err, ErrParse) || errors.Is(err, ErrInvalidRequest)
 }
 
 func (c *Connection) start(ctx context.Context, reader Reader, preempter Preempter) {
@@ -439,7 +498,7 @@ func (c *Connection) write(ctx context.Context, msg Message) error {
 		c.updateInFlight(func(s *inFlightState) {
 			if s.writeErr == nil {
 				s.writeErr = err
-				cause := fmt.Errorf("%w: %v", ErrServerClosing, err)
+				cause := fmt.Errorf("%w: %w", ErrServerClosing, err)
 				for _, r := range s.incomingByID {
 					r.cancel(cause)
 				}
@@ -503,12 +562,19 @@ func (c *Connection) internalErrorf(format string, args ...any) error {
 // will not cause any messages that have not arrived yet with that ID to be
 // cancelled.
 func (c *Connection) Cancel(id ID) {
+	c.CancelCause(id, nil)
+}
+
+// CancelCause is like Cancel, but records cause as the reason the request's
+// Context was canceled, readable through context.Cause. A nil cause reads as
+// context.Canceled.
+func (c *Connection) CancelCause(id ID, cause error) {
 	var req *incomingRequest
 	c.updateInFlight(func(s *inFlightState) {
 		req = s.incomingByID[id]
 	})
 	if req != nil {
-		req.cancel(context.Canceled)
+		req.cancel(cause)
 	}
 }
 
@@ -536,10 +602,22 @@ func (c *Connection) wait(reportIOErrors bool) error {
 	return err
 }
 
+// Close shuts the connection down without waiting on the peer: it stops
+// accepting new calls, cancels the Context of every incoming request still
+// being handled, and fails outgoing calls still awaiting a response with
+// ErrClientClosing. Once the handlers have returned (and their responses have
+// been written) the transport is closed. Close blocks until then.
 func (c *Connection) Close() error {
-	// Stop handling new requests, and interrupt the reader (by closing the
-	// connection) as soon as the active requests finish.
-	c.updateInFlight(func(s *inFlightState) { s.connClosing = true })
+	c.updateInFlight(func(s *inFlightState) {
+		s.connClosing = true
+		for _, r := range s.incomingByID {
+			r.cancel(ErrServerClosing)
+		}
+		for id, ac := range s.outgoingCalls {
+			ac.retire(&Response{ID: id, Error: ErrClientClosing})
+		}
+		s.outgoingCalls = nil
+	})
 	return c.wait(false)
 }
 
@@ -586,10 +664,10 @@ func (s *inFlightState) shouldShutDown(errClosing error) error {
 	}
 
 	if s.readErr != nil {
-		return fmt.Errorf("%w: %v", errClosing, s.readErr)
+		return fmt.Errorf("%w: %w", errClosing, s.readErr)
 	}
 	if s.writeErr != nil {
-		return fmt.Errorf("%w: %v", errClosing, s.writeErr)
+		return fmt.Errorf("%w: %w", errClosing, s.writeErr)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/textproto"
@@ -26,44 +27,82 @@ type Framer interface {
 	Frame(io.ReadWriteCloser) (Reader, Writer)
 }
 
-// strict newline-delimited framer for protocols like MCP stdio and ACP stdio.
-// It requires exactly one complete JSON-RPC message per line.
-type ndFramer struct{}
+// DefaultMaxMessageBytes is the incoming message size limit framers apply when
+// none is configured.
+const DefaultMaxMessageBytes = 32 << 20
+
+// ErrMessageTooLarge is returned by a Reader when an incoming message exceeds
+// its size limit. The stream cannot be resynchronized, so it is fatal.
+var ErrMessageTooLarge = errors.New("JSON RPC message exceeds size limit")
+
+func maxMessageBytes(n int) int {
+	if n == 0 {
+		return DefaultMaxMessageBytes
+	}
+	return n
+}
+
+// NdFramer frames newline-delimited JSON, as used by MCP and ACP over stdio:
+// one complete JSON-RPC message per line. Blank lines are skipped.
+type NdFramer struct {
+	// MaxMessageBytes limits the size of one incoming message. Zero means
+	// DefaultMaxMessageBytes; a negative value means no limit.
+	MaxMessageBytes int
+}
 
 type ndReader struct {
-	in *bufio.Reader
+	in  *bufio.Reader
+	max int
 }
 
 type ndWriter struct {
 	out io.Writer
 }
 
-func NewNdFramer() Framer { return ndFramer{} }
+// NewNdFramer returns an NdFramer with the default size limit.
+func NewNdFramer() Framer { return NdFramer{} }
 
-func (f ndFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
-	return &ndReader{bufio.NewReader(rwc)}, &ndWriter{out: rwc}
+func (f NdFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
+	return &ndReader{in: bufio.NewReader(rwc), max: maxMessageBytes(f.MaxMessageBytes)}, &ndWriter{out: rwc}
 }
 
 func (r *ndReader) Read(ctx context.Context) (Message, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
-	line, err := r.in.ReadBytes('\n')
-	if err != nil {
-		if err == io.EOF && len(line) > 0 {
-			return nil, io.ErrUnexpectedEOF
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
-		return nil, err
-	}
 
-	line = bytes.TrimRight(line, "\r\n")
-	if len(bytes.TrimSpace(line)) == 0 {
-		return nil, fmt.Errorf("empty newline-delimited JSON-RPC message")
+		line, err := r.readLine()
+		if err != nil {
+			if err == io.EOF && len(line) > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		line = bytes.TrimRight(line, "\r\n")
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		return DecodeMessage(line)
 	}
-	return DecodeMessage(line)
+}
+
+// readLine reads through the next newline without buffering more than the
+// size limit (plus room for a CR LF terminator).
+func (r *ndReader) readLine() ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.in.ReadSlice('\n')
+		if r.max > 0 && len(line)+len(chunk) > r.max+2 {
+			return nil, ErrMessageTooLarge
+		}
+		line = append(line, chunk...)
+		if err != bufio.ErrBufferFull {
+			return line, err
+		}
+	}
 }
 
 func (w *ndWriter) Write(ctx context.Context, msg Message) error {
@@ -82,22 +121,27 @@ func (w *ndWriter) Write(ctx context.Context, msg Message) error {
 	return err
 }
 
-// messages with framed headers, where each message is preceded by a Content-Length header specifying the length of the message in bytes
-// used by LSP
-type headerFramer struct{}
+// HeaderFramer frames messages behind a Content-Length header, as used by LSP.
+type HeaderFramer struct {
+	// MaxMessageBytes limits the size of one incoming message. Zero means
+	// DefaultMaxMessageBytes; a negative value means no limit.
+	MaxMessageBytes int
+}
 
 type headerReader struct {
-	in *bufio.Reader
+	in  *bufio.Reader
+	max int
 }
 
 type headerWriter struct {
 	out io.Writer
 }
 
-func NewHeaderFramer() Framer { return headerFramer{} }
+// NewHeaderFramer returns a HeaderFramer with the default size limit.
+func NewHeaderFramer() Framer { return HeaderFramer{} }
 
-func (f headerFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
-	return &headerReader{bufio.NewReader(rwc)}, &headerWriter{rwc}
+func (f HeaderFramer) Frame(rwc io.ReadWriteCloser) (Reader, Writer) {
+	return &headerReader{in: bufio.NewReader(rwc), max: maxMessageBytes(f.MaxMessageBytes)}, &headerWriter{rwc}
 }
 
 func (r *headerReader) Read(ctx context.Context) (Message, error) {
@@ -117,6 +161,9 @@ func (r *headerReader) Read(ctx context.Context) (Message, error) {
 	contentLength, err := strconv.ParseInt(clStr, 10, 32)
 	if err != nil || contentLength <= 0 {
 		return nil, fmt.Errorf("invalid Content-Length: %v", clStr)
+	}
+	if r.max > 0 && contentLength > int64(r.max) {
+		return nil, ErrMessageTooLarge
 	}
 
 	data := make([]byte, contentLength)

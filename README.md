@@ -23,10 +23,41 @@ extracted to be used as a standalone library
 - Added WebSocket transport helpers via a small adapter interface.
 - Resolved all TODO from the original implementation
 - Using newer golang apis
+- Handlers run on their own goroutine and can call `jsonrpc2.Async(ctx)` to let
+  later messages be handled concurrently (as in the MCP Go SDK's fork).
+- Malformed input (invalid JSON, non-object values such as batches, blank lines)
+  is answered with a `null`-id error response, or skipped, without closing the
+  connection. A malformed response fails its pending call instead of hanging it,
+  and responses are never answered, so two peers can't bounce errors forever.
+- Framers cap incoming messages at `DefaultMaxMessageBytes` (32 MiB); set
+  `NdFramer{MaxMessageBytes: n}` / `HeaderFramer{MaxMessageBytes: n}` to change it.
+- `Close` doesn't wait on the peer: it cancels in-flight handlers and fails
+  pending calls, then closes the transport once the handlers return. Losing the
+  read side (peer gone) also cancels in-flight handlers. Causes are readable via
+  `context.Cause`, and `CancelCause` records one explicitly.
+
+## Concurrency
+
+`Handle` is called for each message in arrival order. The next message is not
+dispatched until the current handler returns or calls `jsonrpc2.Async(ctx)`, so
+ordering-sensitive work (for example registering state that a later
+notification will look up) can run before releasing the queue:
+
+```go
+Handler: jsonrpc2.HandlerFunc(func(ctx context.Context, req *jsonrpc2.Request) (any, error) {
+	if req.IsCall() {
+		jsonrpc2.Async(ctx) // long-running calls must not block later messages
+	}
+	return handle(ctx, req)
+})
+```
+
+Notifications that never call `Async` keep their relative order.
 
 ## Future plans
 
-- [] maybe support batching (not used in any protocols as of right now)
+- [] maybe support batching (LSP never uses it, MCP removed it in 2025-06-18,
+  and stable ACP rejects it)
 
 ## LSP over stdio
 

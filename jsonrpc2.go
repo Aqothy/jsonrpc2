@@ -44,8 +44,10 @@ var _ Preempter = PreempterFunc(nil)
 
 // Handler handles messages on a connection.
 type Handler interface {
-	// Handle is invoked sequentially for each incoming request that has not
-	// already been handled by a Preempter in a queue.
+	// Handle is invoked for each incoming request that has not already been
+	// handled by a Preempter, in the order the requests arrived. The next
+	// request is not handed to Handle until this call returns or calls Async
+	// with its ctx; after Async, both run concurrently.
 	//
 	// If the Request has a nil ID, Handle must return a nil result,
 	// and any error may be logged but will not be reported to the caller.

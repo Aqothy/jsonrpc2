@@ -514,11 +514,10 @@ func TestWaitReturnsReadError(t *testing.T) {
 func TestMalformedHandlerResultSendsInternalErrorResponse(t *testing.T) {
 	writer := newCaptureTestWriter()
 	reported := make(chan error, 1)
+	reads := make(chan streamReadResult, 2)
+	reads <- streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "bad"}}
 	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
-		Reader: &streamChannelReader{ch: closedStreamReadResults(
-			streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "bad"}},
-			streamReadResult{err: io.EOF},
-		)},
+		Reader:          &streamChannelReader{ch: reads},
 		Writer:          writer,
 		Closer:          closeFunc(func() error { return nil }),
 		OnInternalError: func(err error) { reported <- err },
@@ -528,11 +527,11 @@ func TestMalformedHandlerResultSendsInternalErrorResponse(t *testing.T) {
 			})
 		},
 	})
+	msg := <-writer.ch
+	reads <- streamReadResult{err: io.EOF}
 	if err := conn.Wait(); err != nil {
 		t.Fatal(err)
 	}
-
-	msg := <-writer.ch
 	resp, ok := msg.(*jsonrpc2.Response)
 	if !ok {
 		t.Fatalf("wrote %T, want *Response", msg)
@@ -640,10 +639,17 @@ func TestDecodeNullRequestIDAsMissing(t *testing.T) {
 	}
 }
 
-func TestDecodeRejectsNullResponseID(t *testing.T) {
-	_, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","id":null,"result":null}`))
-	if !errors.Is(err, jsonrpc2.ErrInvalidRequest) {
-		t.Fatalf("DecodeMessage null response ID error = %v, want ErrInvalidRequest", err)
+// A response with a null id (typically a peer reporting our malformed
+// message) decodes as an unroutable response, never as a request error that
+// would itself be answered.
+func TestDecodeNullResponseIDIsUnroutableResponse(t *testing.T) {
+	msg, err := jsonrpc2.DecodeMessage([]byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, ok := msg.(*jsonrpc2.Response)
+	if !ok || resp.ID.IsValid() || !errors.Is(resp.Error, jsonrpc2.ErrParse) {
+		t.Fatalf("decoded %#v, want response with null id and parse error", msg)
 	}
 }
 
@@ -670,11 +676,10 @@ func TestMissingIDIsNotification(t *testing.T) {
 
 func TestHandlerNilResultSendsNullResult(t *testing.T) {
 	writer := newCaptureTestWriter()
+	reads := make(chan streamReadResult, 2)
+	reads <- streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "null"}}
 	conn := jsonrpc2.NewConnection(context.Background(), jsonrpc2.ConnectionConfig{
-		Reader: &streamChannelReader{ch: closedStreamReadResults(
-			streamReadResult{msg: &jsonrpc2.Request{ID: jsonrpc2.Int64ID(1), Method: "null"}},
-			streamReadResult{err: io.EOF},
-		)},
+		Reader: &streamChannelReader{ch: reads},
 		Writer: writer,
 		Closer: closeFunc(func() error { return nil }),
 		Bind: func(*jsonrpc2.Connection) jsonrpc2.Handler {
@@ -683,10 +688,12 @@ func TestHandlerNilResultSendsNullResult(t *testing.T) {
 			})
 		},
 	})
+	msg := <-writer.ch
+	reads <- streamReadResult{err: io.EOF}
 	if err := conn.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	resp, ok := (<-writer.ch).(*jsonrpc2.Response)
+	resp, ok := msg.(*jsonrpc2.Response)
 	if !ok {
 		t.Fatal("wrote non-response")
 	}

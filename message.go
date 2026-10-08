@@ -85,7 +85,7 @@ func (id ID) IsZero() bool {
 
 // interface for json rpc messages, both request and response
 type Message interface {
-	marshal(to *wireCombined)
+	wire() any
 }
 
 // Message from client to server, either a call or a notification
@@ -157,10 +157,8 @@ func NewCall(id ID, method string, params any) (*Request, error) {
 // valid ids are calls (need to be responded to) and invalid ids are notifications (don't need to be responded to)
 func (msg *Request) IsCall() bool { return msg.ID.IsValid() }
 
-func (msg *Request) marshal(to *wireCombined) {
-	to.ID = msg.ID
-	to.Method = msg.Method
-	to.Params = msg.Params
+func (msg *Request) wire() any {
+	return &wireRequest{RPCVersion: RPCVersion, ID: msg.ID, Method: msg.Method, Params: msg.Params}
 }
 
 // NewResponse constructs a response. If resErr is nil and result is nil,
@@ -176,17 +174,17 @@ func NewResponse(id ID, result any, resErr error) (*Response, error) {
 	return &Response{ID: id, Result: responseRaw}, err
 }
 
-func (msg *Response) marshal(to *wireCombined) {
-	to.ID = msg.ID
-	if msg.Error != nil {
-		to.Error = toWireError(msg.Error)
-		return
+func (msg *Response) wire() any {
+	w := &wireResponse{RPCVersion: RPCVersion, ID: msg.ID}
+	switch {
+	case msg.Error != nil:
+		w.Error = toWireError(msg.Error)
+	case msg.Result == nil:
+		w.Result = json.RawMessage("null")
+	default:
+		w.Result = msg.Result
 	}
-	if msg.Result == nil {
-		to.Result = json.RawMessage("null")
-	} else {
-		to.Result = msg.Result
-	}
+	return w
 }
 
 func toWireError(err error) *WireError {
@@ -216,52 +214,70 @@ func wireErrorCode(err error) int64 {
 }
 
 func EncodeMessage(msg Message) ([]byte, error) {
-	wire := &wireCombined{RPCVersion: RPCVersion}
-	msg.marshal(wire)
-	data, err := json.Marshal(wire)
+	data, err := json.Marshal(msg.wire())
 	if err != nil {
 		return nil, fmt.Errorf("marshaling jsonrpc message: %w", err)
 	}
 	return data, nil
 }
 
+// DecodeMessage decodes one JSON-RPC message.
+//
+// Errors wrapping ErrParse or ErrInvalidRequest mean the data was not a usable
+// message; a Connection answers those with an error response whose id is
+// null and keeps reading. Response-shaped input is never answered: a
+// malformed response is returned as a *Response carrying an error, so a
+// matching pending call fails instead of hanging, and a response whose id is
+// missing or null is reported as unexpected.
+//
+// Decoding is lenient where it is safe to be: a missing "jsonrpc" member is
+// accepted, and "error": null next to a result is ignored.
 func DecodeMessage(data []byte) (Message, error) {
-	msg := wireCombined{}
+	var msg wireIncoming
 	if err := json.Unmarshal(data, &msg); err != nil {
-		return nil, fmt.Errorf("unmarshaling jsonrpc message: %w", err)
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			// Valid JSON, but not a message object (e.g. a batch array).
+			return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrParse, err)
 	}
-	if msg.RPCVersion != RPCVersion {
-		return nil, fmt.Errorf("invalid message version tag %q; expected %q", msg.RPCVersion, RPCVersion)
+	if msg.RPCVersion != nil && *msg.RPCVersion != RPCVersion {
+		return nil, fmt.Errorf("%w: version tag %q, expected %q", ErrInvalidRequest, *msg.RPCVersion, RPCVersion)
 	}
-
-	if msg.Method != "" {
-		// has a method, must be a call
-		return &Request{
-			Method: msg.Method,
-			ID:     msg.ID,
-			Params: msg.Params,
-		}, nil
-	}
-
-	// no method, should be a response
-
-	if !msg.ID.IsValid() {
-		return nil, ErrInvalidRequest
+	var id ID
+	var idErr error
+	if len(msg.ID) > 0 {
+		idErr = id.UnmarshalJSON(msg.ID)
 	}
 
-	hasResult := msg.Result != nil
-	hasError := msg.Error != nil
-	if hasResult == hasError {
-		return nil, ErrInvalidRequest
+	if msg.Method != nil {
+		if idErr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrParse, idErr)
+		}
+		return &Request{ID: id, Method: *msg.Method, Params: msg.Params}, nil
 	}
 
-	resp := &Response{
-		ID: msg.ID,
+	if msg.ID == nil && msg.Result == nil && msg.Error == nil {
+		return nil, fmt.Errorf("%w: message has neither a method nor a response member", ErrInvalidRequest)
 	}
-	if hasResult {
+
+	resp := &Response{ID: id}
+	switch {
+	case idErr != nil:
+		resp.ID = ID{}
+		resp.Error = fmt.Errorf("%w: response id: %v", ErrInvalidRequest, idErr)
+	case len(msg.Error) > 0 && string(msg.Error) != "null":
+		var wireErr WireError
+		if err := json.Unmarshal(msg.Error, &wireErr); err != nil {
+			resp.Error = fmt.Errorf("%w: malformed response error: %v", ErrInvalidRequest, err)
+		} else {
+			resp.Error = &wireErr
+		}
+	case msg.Result != nil:
 		resp.Result = msg.Result
-	} else {
-		resp.Error = msg.Error
+	default:
+		resp.Error = fmt.Errorf("%w: response has neither result nor error", ErrInvalidRequest)
 	}
 	return resp, nil
 }
