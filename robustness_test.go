@@ -214,3 +214,49 @@ type rwc struct{ io.Reader }
 
 func (rwc) Write(p []byte) (int, error) { return len(p), nil }
 func (rwc) Close() error                { return nil }
+
+// A call's then runs as its response is read, before the message after it is
+// handled, however the goroutine awaiting the call is scheduled.
+func TestCallThenRunsBeforeTheNextMessage(t *testing.T) {
+	a, b := net.Pipe()
+	events := make(chan string, 2)
+	conn := jsonrpc2.NewStreamConnection(context.Background(), a, jsonrpc2.ConnectionOptions{
+		Framer: jsonrpc2.NewNdFramer(),
+		Preempter: jsonrpc2.PreempterFunc(func(_ context.Context, req *jsonrpc2.Request) (any, error) {
+			events <- req.Method
+			return nil, nil
+		}),
+		OnInternalError: func(error) {},
+	})
+	t.Cleanup(func() {
+		_ = b.Close()
+		_ = conn.Close()
+	})
+	peer := &rawPeer{conn: b, in: bufio.NewReader(b)}
+
+	awaited := make(chan error, 1)
+	go func() {
+		call := conn.CallThen(context.Background(), "start", nil, func(response *jsonrpc2.Response) {
+			events <- "then " + string(response.Result)
+		})
+		awaited <- call.Await(context.Background(), nil)
+	}()
+	if req := peer.receive(t); req["method"] != "start" {
+		t.Fatalf("call = %v", req)
+	}
+	// The response and the notification it makes possible arrive together.
+	peer.send(t, `{"jsonrpc":"2.0","id":1,"result":"ok"}`+"\n"+`{"jsonrpc":"2.0","method":"started"}`)
+	for _, want := range []string{`then "ok"`, "started"} {
+		select {
+		case got := <-events:
+			if got != want {
+				t.Fatalf("event = %q, want %q: then runs before the next message", got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no event, want %q", want)
+		}
+	}
+	if err := <-awaited; err != nil {
+		t.Fatal(err)
+	}
+}

@@ -124,11 +124,21 @@ type Connection struct {
 // You don't have to wait for the response, it can be ignored if not needed
 // If sending the call failed then the response will be ready and have the error in it
 func (c *Connection) Call(ctx context.Context, method string, params any) *PendingCall {
+	return c.CallThen(ctx, method, params, nil)
+}
+
+// CallThen is Call with onResponse run on the reading goroutine when the
+// response arrives: before Await returns and before any later message is
+// read, so state the response creates is in place for the messages that
+// follow it. onResponse must not block. It isn't run for a call that ends
+// without a response.
+func (c *Connection) CallThen(ctx context.Context, method string, params any, onResponse func(*Response)) *PendingCall {
 	id := Int64ID(c.seq.Add(1))
 
 	ac := &PendingCall{
-		id:    id,
-		ready: make(chan struct{}),
+		id:         id,
+		ready:      make(chan struct{}),
+		onResponse: onResponse,
 	}
 
 	// When this method returns, either ac is retired, or the request has been
@@ -411,18 +421,20 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, preempter 
 		case *Request:
 			c.acceptRequest(ctx, msg, preempter)
 		case *Response:
-			var unexpected bool
+			var ac *PendingCall
 			c.updateInFlight(func(s *inFlightState) {
-				if ac, ok := s.outgoingCalls[msg.ID]; ok {
+				if ac = s.outgoingCalls[msg.ID]; ac != nil {
 					delete(s.outgoingCalls, msg.ID)
-					ac.retire(msg)
-				} else {
-					// dont call user internalErrorf here since user code could
-					// call back into inFlightState which causes deadlock
-					unexpected = true
 				}
 			})
-			if unexpected {
+			// Outside the state lock: onResponse is the caller's code, and like
+			// internalErrorf it could call back into the connection.
+			if ac != nil {
+				if ac.onResponse != nil {
+					ac.onResponse(msg)
+				}
+				ac.retire(msg)
+			} else {
 				if msg.Error != nil {
 					c.internalErrorf("received error response for unknown request ID %v: %v", msg.ID, msg.Error)
 				} else {
@@ -719,6 +731,9 @@ type PendingCall struct {
 	id       ID
 	ready    chan struct{} // closed after response has been set
 	response *Response
+	// onResponse, when set, runs on the reading goroutine before the
+	// response is set.
+	onResponse func(*Response)
 }
 
 func (ac *PendingCall) ID() ID {
